@@ -2,50 +2,98 @@ import os
 import logging
 import pandas as pd # For CSV export
 import datetime # Add datetime import for timezone-aware time
+import time # For local timezone name
 
 # Define output directories relative to the main script or a base path
 REPORT_DIR = "reports"
 DIAGRAM_DIR = "diagrams"
 DATA_DIR = "data" # Reuse from main?
 
-def generate_markdown_report(all_data, base_output_dir, diagram_paths={}, timestamp_str=""):
-    """Generates a timestamped Markdown report from the collected Azure data.
+# Global flag for silent mode
+SILENT_MODE = False
+
+def generate_markdown_report(all_data, base_output_dir, tenant_display_name, tenant_default_domain, document_version, diagram_paths={}, timestamp_str="", silent_mode=False):
+    """Generates a timestamped Azure Audit Report in Markdown format.
 
     Args:
         all_data (dict): The aggregated data from all fetchers.
         base_output_dir (str): The base directory for outputs.
-        diagram_paths (dict): A dictionary mapping subscription IDs to their generated diagram paths.
+        tenant_display_name (str): The fetched display name of the tenant.
+        tenant_default_domain (str): The fetched default domain of the tenant (used less in Audit).
+        document_version (float): The version number for this document run (e.g., 1.0, 2.0).
+        diagram_paths (dict): Dictionary mapping subscription IDs to their diagram file paths.
         timestamp_str (str): Timestamp string for filenames.
+        silent_mode (bool): Whether to suppress console output.
 
     Returns:
         str: The full path to the generated markdown file, or None if failed.
     """
-    report_path = os.path.join(base_output_dir, REPORT_DIR)
-    csv_path = os.path.join(base_output_dir, DATA_DIR)
-    os.makedirs(report_path, exist_ok=True)
-    os.makedirs(csv_path, exist_ok=True)
+    global SILENT_MODE
+    SILENT_MODE = silent_mode
+
+    report_path_dir = os.path.join(base_output_dir, REPORT_DIR)
+    os.makedirs(report_path_dir, exist_ok=True)
 
     # Prepare timestamp suffix for filenames
     time_suffix = f"_{timestamp_str}" if timestamp_str else ""
+    # Include version in filename
+    report_filename = f"Azure_Audit_Report_{tenant_display_name.replace(' ', '_')}{time_suffix}_v{document_version:.1f}.md"
+    report_filepath = os.path.join(report_path_dir, report_filename)
+
+    if not SILENT_MODE:
+        print(f"Generating Markdown Audit Report: {report_filepath}")
+    logging.info(f"Generating Markdown Audit Report: {report_filepath}")
 
     md_content = []
     all_resources_list = [] # For CSV export
 
-    # Try to determine tenant name from subscription data
-    tenant_name = "Azure Tenant"
-    for sub_id, sub_data in all_data.items():
-        if "subscription_info" in sub_data and "tenant_domain" in sub_data["subscription_info"]:
-            tenant_name = sub_data["subscription_info"]["tenant_domain"]
-            break
-
-    md_content.append(f"# Azure Infrastructure Audit Report for {tenant_name} ({timestamp_str})")
-    md_content.append(f"Generated on: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    # --- Use passed-in tenant name for title --- 
+    report_tenant_name = tenant_display_name if tenant_display_name and "(Tenant ID)" not in tenant_display_name else "Azure Environment"
+    if not report_tenant_name: report_tenant_name = "Azure Environment" # Final fallback
+    
+    md_content.append(f"# Azure Infrastructure Audit Report for {report_tenant_name} ({timestamp_str})")
+    md_content.append(f"Generated on: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     md_content.append(f"Run ID: `{timestamp_str}`")
     md_content.append("## Tenant Summary")
     md_content.append(f"- **Total Subscriptions Found:** {len(all_data)}")
-    # Add more tenant-level summaries later (e.g., total cost, total resources)
     
-    # Add a dedicated security section at the tenant level for critical information
+    # Add more tenant-level summaries
+    total_resources = 0
+    resource_type_counts = {}
+    total_vnets = 0
+    total_subnets = 0
+    
+    for sub_id, data in all_data.items():
+        if "error" in data:
+            continue
+            
+        # Count resources
+        resources = data.get("resources", [])
+        total_resources += len(resources)
+        
+        # Count resource types
+        for res in resources:
+            res_type = res.get("type", "Unknown")
+            resource_type_counts[res_type] = resource_type_counts.get(res_type, 0) + 1
+            
+        # Count network resources    
+        networking = data.get("networking", {})
+        total_vnets += len(networking.get("vnets", []))
+        total_subnets += len(networking.get("subnets", []))
+    
+    md_content.append(f"- **Total Resources:** {total_resources}")
+    md_content.append(f"- **Total VNets:** {total_vnets}")
+    md_content.append(f"- **Total Subnets:** {total_subnets}")
+    
+    # Add resource type breakdown
+    if resource_type_counts:
+        md_content.append("\n### Resource Type Breakdown")
+        md_content.append("| Resource Type | Count |")
+        md_content.append("|--------------|-------|")
+        for res_type, count in sorted(resource_type_counts.items(), key=lambda x: x[1], reverse=True):
+            md_content.append(f"| `{res_type}` | {count} |")
+    
+    # --- List Global Admins and Privileged Accounts ---
     md_content.append("\n## Tenant-Wide Security Information")
     
     # --- List Global Admins and Privileged Accounts ---
@@ -231,9 +279,18 @@ def generate_markdown_report(all_data, base_output_dir, diagram_paths={}, timest
         md_content.append("\n### Resource Inventory")
         # Summary list first
         md_content.append(f"- **Total Resources:** {len(resources)}")
+        
+        # Group resources by type to provide better organization
+        resources_by_type = {}
+        for res in resources:
+            res_type = res.get("type", "Unknown")
+            if res_type not in resources_by_type:
+                resources_by_type[res_type] = []
+            resources_by_type[res_type].append(res)
+        
         # Now, the table (outside the list item)
         if resources:
-            md_content.append("\n| Name | Type | Location | Resource Group | Tags |") # Add newline before table
+            md_content.append("\n| Name | Type | Location | Resource Group | Tags |")
             md_content.append("|---|---|---|---|---|")
             for res in sorted(resources, key=lambda x: (x['resource_group'], x['name'])):
                 tags_str = ", ".join([f"`{k}={v}`" for k, v in res.get("tags", {}).items()]) if res.get("tags") else ""
@@ -244,6 +301,69 @@ def generate_markdown_report(all_data, base_output_dir, diagram_paths={}, timest
                 res_copy['subscription_name'] = sub_display_name
                 res_copy['tags_str'] = tags_str # Add flattened tags for easier CSV
                 all_resources_list.append(res_copy)
+            
+            # Add detailed section for App Services with their configurations
+            app_services = [res for res in resources if res.get("type") == "Microsoft.Web/sites" and "app_service_details" in res]
+            if app_services:
+                md_content.append("\n#### App Service Details")
+                for app in app_services:
+                    md_content.append(f"\n**{app['name']}** (Resource Group: {app['resource_group']})")
+                    
+                    app_details = app.get("app_service_details", {})
+                    
+                    # App Settings
+                    config = app_details.get("configuration", {})
+                    if config:
+                        md_content.append("\n**Application Settings:**")
+                        md_content.append("| Key | Value |")
+                        md_content.append("|-----|-------|")
+                        for key, value in config.items():
+                            # Mask sensitive values
+                            if any(secret_keyword in key.lower() for secret_keyword in ['key', 'secret', 'password', 'pwd', 'token', 'connection']):
+                                masked_value = "********"
+                                md_content.append(f"| {key} | {masked_value} |")
+                            else:
+                                # Truncate values if they're too long
+                                display_value = str(value)
+                                if len(display_value) > 50:
+                                    display_value = display_value[:47] + "..."
+                                md_content.append(f"| {key} | {display_value} |")
+                    
+                    # Connection Strings (masked)
+                    conn_strings = app_details.get("connection_strings", {})
+                    if conn_strings:
+                        md_content.append("\n**Connection Strings:**")
+                        md_content.append("| Name | Type |")
+                        md_content.append("|------|------|")
+                        for name, details in conn_strings.items():
+                            conn_type = details.get("type", "Unknown") if isinstance(details, dict) else "Unknown"
+                            md_content.append(f"| {name} | {conn_type} |")
+                    
+                    # Auth Settings
+                    auth_settings = app_details.get("auth_settings", {})
+                    if auth_settings and isinstance(auth_settings, dict) and auth_settings:
+                        md_content.append("\n**Authentication Settings:**")
+                        auth_enabled = auth_settings.get("enabled", False)
+                        md_content.append(f"- **Auth Enabled:** {auth_enabled}")
+                        if auth_enabled:
+                            providers = []
+                            if auth_settings.get("microsoft_account_client_id"):
+                                providers.append("Microsoft")
+                            if auth_settings.get("google_client_id"):
+                                providers.append("Google")
+                            if auth_settings.get("facebook_client_id"):
+                                providers.append("Facebook")
+                            if auth_settings.get("twitter_consumer_key"):
+                                providers.append("Twitter")
+                            if auth_settings.get("aad_client_id"):
+                                providers.append("Azure AD")
+                            
+                            if providers:
+                                md_content.append(f"- **Providers:** {', '.join(providers)}")
+            
+            # Add detailed section for networking resources if needed
+            # ... add more specialized sections for specific resource types
+            
         else:
             md_content.append("_No resources found or unable to fetch._")
 
@@ -356,8 +476,6 @@ def generate_markdown_report(all_data, base_output_dir, diagram_paths={}, timest
         # Add tables/details for policies and recommendations later
 
     # --- Save Markdown Report ---
-    report_filename = f"azure_audit_report{time_suffix}.md"
-    report_filepath = os.path.join(report_path, report_filename)
     markdown_saved = False
     try:
         with open(report_filepath, 'w', encoding='utf-8') as f:
@@ -370,8 +488,8 @@ def generate_markdown_report(all_data, base_output_dir, diagram_paths={}, timest
     # --- Save Resources CSV ---
     csv_filepath = None
     if all_resources_list:
-        csv_filename = f"azure_resource_inventory{time_suffix}.csv"
-        csv_filepath = os.path.join(csv_path, csv_filename)
+        csv_filename = f"azure_resource_inventory_{timestamp_str}.csv"
+        csv_filepath = os.path.join(report_path_dir, csv_filename)
         try:
             df = pd.DataFrame(all_resources_list)
             # Select and order columns for CSV clarity
@@ -386,4 +504,4 @@ def generate_markdown_report(all_data, base_output_dir, diagram_paths={}, timest
             csv_filepath = None
 
     # Return the Markdown report path if successful
-    return report_filepath if markdown_saved else None 
+    return report_filepath if markdown_saved else None

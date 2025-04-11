@@ -1,16 +1,39 @@
 import logging
+# Use PolicyClient for assignments
+from azure.mgmt.resource.policy import PolicyClient
 from azure.mgmt.policyinsights import PolicyInsightsClient
 from azure.mgmt.advisor import AdvisorManagementClient
 from azure.core.exceptions import HttpResponseError
 from azure.mgmt.policyinsights.models import QueryOptions
 
 def fetch_governance_details(credential, subscription_id):
-    """Fetches Policy compliance states and Advisor recommendations."""
+    """Fetches Policy assignments, compliance states, and Advisor recommendations."""
     logging.info(f"[{subscription_id}] Fetching governance details (Policy, Advisor)...")
     governance_data = {
+        "policy_assignments": [],
         "policy_states": [],
         "advisor_recommendations": []
     }
+
+    # Fetch Policy Assignments
+    try:
+        # Use PolicyClient instead of ResourceManagementClient for assignments
+        policy_client = PolicyClient(credential, subscription_id)
+        # Try using list() - maybe it implicitly uses the client's subscription scope?
+        assignments = list(policy_client.policy_assignments.list())
+        logging.info(f"[{subscription_id}] Found {len(assignments)} policy assignments at subscription scope.")
+        for assign in assignments:
+            governance_data["policy_assignments"].append({
+                "id": assign.id,
+                "name": assign.name,
+                "display_name": assign.display_name,
+                "policy_definition_id": assign.policy_definition_id,
+                "scope": assign.scope,
+            })
+    except HttpResponseError as e:
+        logging.warning(f"[{subscription_id}] Could not list Policy Assignments (Check Permissions?): {e.message}")
+    except Exception as e:
+        logging.error(f"[{subscription_id}] Unexpected error fetching Policy Assignments: {e}")
 
     # Fetch Policy Compliance States
     try:
@@ -36,6 +59,7 @@ def fetch_governance_details(credential, subscription_id):
                 "policy_assignment_id": state.policy_assignment_id,
                 "policy_definition_id": state.policy_definition_id,
                 "is_compliant": state.is_compliant,
+                "compliance_state": "NonCompliant",
                 "subscription_id": state.subscription_id,
                 "resource_type": state.resource_type,
                 "resource_location": state.resource_location,

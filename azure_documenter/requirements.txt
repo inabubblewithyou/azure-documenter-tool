@@ -15,4 +15,5 @@ markdown
 graphviz
 openai
 python-dotenv
-pandas 
+pandas
+rich 

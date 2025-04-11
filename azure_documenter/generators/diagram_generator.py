@@ -98,14 +98,14 @@ def generate_vnet_diagram(subscription_data, diagram_output_path, timestamp_str)
                              color='blue', style='dashed', constraint='false') # constraint=false helps layout
 
         # Render the diagram (e.g., to PNG)
-        # Ensure the diagram path exists
         os.makedirs(diagram_output_path, exist_ok=True)
         output_format = 'png' # Or svg
-        rendered_path = dot.render(filename_base, directory=diagram_output_path, format=output_format, cleanup=True) # cleanup removes the .gv source
+        # Pass only the base filename (without directory) to render
+        rendered_path = dot.render(filename_base, directory=diagram_output_path, format=output_format, cleanup=True, view=False) # cleanup removes the .gv source, view=False prevents opening
 
         logging.info(f"[{sub_id}] Successfully generated VNet diagram: {rendered_path}")
-        # Return the path relative to the base output dir?
-        return os.path.relpath(rendered_path, os.path.dirname(diagram_output_path))
+        # Return ONLY the filename
+        return os.path.basename(rendered_path)
 
     except Exception as e:
         logging.error(f"[{sub_id}] Failed to generate VNet diagram: {e}")
@@ -306,10 +306,11 @@ def generate_tenant_network_diagram(all_data, diagram_output_path, timestamp_str
         dot.attr(dpi='150')  # Lower DPI, we need compact diagram
         dot.attr(size='9,5')  # Smaller size (inches)
         
-        rendered_path = dot.render(filename_base, directory=diagram_output_path, format=output_format, cleanup=True)
+        rendered_path = dot.render(filename_base, directory=diagram_output_path, format=output_format, cleanup=True, view=False)
         
-        logging.info(f"Successfully generated tenant-wide network diagram: {rendered_path}")
-        return os.path.relpath(rendered_path, os.path.dirname(diagram_output_path))
+        logging.info(f"Tenant-wide network diagram generated: {rendered_path}")
+        # Return ONLY the filename
+        return os.path.basename(rendered_path)
             
     except Exception as e:
         logging.error(f"Failed to generate tenant-wide network diagram: {e}")
