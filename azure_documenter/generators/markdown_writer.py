@@ -93,6 +93,26 @@ def generate_markdown_report(all_data, base_output_dir, tenant_display_name, ten
         for res_type, count in sorted(resource_type_counts.items(), key=lambda x: x[1], reverse=True):
             md_content.append(f"| `{res_type}` | {count} |")
     
+    # --- Load Balancing Strategy ---
+    md_content.append("\n## Load Balancing Strategy")
+    all_lbs = []
+    all_ags = []
+    all_fds = []
+    all_tms = []
+    for sub_id, data in all_data.items():
+        if "error" in data or "networking" not in data:
+            continue
+        networking = data["networking"]
+        all_lbs.extend(networking.get("load_balancers", []))
+        all_ags.extend(networking.get("application_gateways", []))
+        all_fds.extend(networking.get("front_doors", []))
+        all_tms.extend(networking.get("traffic_manager_profiles", []))
+
+    md_content.extend(_generate_lb_table(all_lbs))
+    md_content.extend(_generate_ag_table(all_ags))
+    md_content.extend(_generate_fd_table(all_fds))
+    md_content.extend(_generate_tm_table(all_tms))
+
     # --- List Global Admins and Privileged Accounts ---
     md_content.append("\n## Tenant-Wide Security Information")
     
@@ -505,3 +525,83 @@ def generate_markdown_report(all_data, base_output_dir, tenant_display_name, ten
 
     # Return the Markdown report path if successful
     return report_filepath if markdown_saved else None
+
+# --- Helper functions for generating tables ---
+
+def _generate_lb_table(lbs):
+    content = ["\n### Azure Load Balancers"]
+    if not lbs:
+        content.append("\n_No Azure Load Balancers found._")
+        return content
+    
+    content.append("\n| Name | Resource Group | Location | SKU | Frontend IPs | Backend Pools | Rules |")
+    content.append("|---|---|---|---|---|---|---|")
+    for lb in sorted(lbs, key=lambda x: x.get("name", "")):
+        name = lb.get("name", "Unknown")
+        rg = lb.get("resource_group", "Unknown")
+        loc = lb.get("location", "Unknown")
+        sku = lb.get("sku", "Unknown")
+        frontends = lb.get("frontend_ip_configurations_count", 0)
+        backends = lb.get("backend_address_pools_count", 0)
+        rules = lb.get("load_balancing_rules_count", 0)
+        content.append(f"| {name} | {rg} | {loc} | {sku} | {frontends} | {backends} | {rules} |")
+    return content
+
+def _generate_ag_table(ags):
+    content = ["\n### Application Gateways"]
+    if not ags:
+        content.append("\n_No Application Gateways found._")
+        return content
+    
+    content.append("\n| Name | Resource Group | Location | SKU Tier | WAF Policy | Frontend IPs | Backend Pools | HTTP Listeners |")
+    content.append("|---|---|---|---|---|---|---|---|")
+    for ag in sorted(ags, key=lambda x: x.get("name", "")):
+        name = ag.get("name", "Unknown")
+        rg = ag.get("resource_group", "Unknown")
+        loc = ag.get("location", "Unknown")
+        sku = ag.get("sku", "Unknown") # Often a dict like {'name': 'WAF_v2', 'tier': 'WAF_v2'}
+        sku_tier = sku.get("tier", "Unknown") if isinstance(sku, dict) else sku # Extract tier if possible
+        waf_policy = ag.get("waf_policy_name", "N/A")
+        frontends = ag.get("frontend_ip_configurations_count", 0)
+        backends = ag.get("backend_address_pools_count", 0)
+        listeners = ag.get("http_listeners_count", 0)
+        content.append(f"| {name} | {rg} | {loc} | {sku_tier} | {waf_policy} | {frontends} | {backends} | {listeners} |")
+    return content
+
+def _generate_fd_table(fds):
+    content = ["\n### Azure Front Doors (Standard/Premium)"]
+    if not fds:
+        content.append("\n_No Azure Front Doors (Standard/Premium) found._")
+        return content
+    
+    content.append("\n| Name | Resource Group | Location | Provisioning State | Frontend Endpoints | Routing Rules |")
+    content.append("|---|---|---|---|---|---|")
+    for fd in sorted(fds, key=lambda x: x.get("name", "")):
+        name = fd.get("name", "Unknown")
+        rg = fd.get("resource_group", "Unknown")
+        loc = fd.get("location", "Unknown")
+        state = fd.get("provisioning_state", "Unknown")
+        frontends = fd.get("frontend_endpoints_count", 0)
+        rules = fd.get("routing_rules_count", 0)
+        content.append(f"| {name} | {rg} | {loc} | {state} | {frontends} | {rules} |")
+    return content
+
+def _generate_tm_table(tms):
+    content = ["\n### Traffic Manager Profiles"]
+    if not tms:
+        content.append("\n_No Traffic Manager Profiles found._")
+        return content
+    
+    content.append("\n| Name | Resource Group | Status | Routing Method | Relative DNS | Endpoints |")
+    content.append("|---|---|---|---|---|---|")
+    for tm in sorted(tms, key=lambda x: x.get("name", "")):
+        name = tm.get("name", "Unknown")
+        rg = tm.get("resource_group", "Unknown")
+        status = tm.get("profile_status", "Unknown")
+        routing = tm.get("routing_method", "Unknown")
+        dns = tm.get("dns_config_relative_name", "N/A")
+        endpoints = tm.get("endpoints_count", 0)
+        content.append(f"| {name} | {rg} | {status} | {routing} | {dns}.trafficmanager.net | {endpoints} |")
+    return content
+
+# --- End Helper functions ---

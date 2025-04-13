@@ -1,11 +1,19 @@
 import logging
+import asyncio # Import asyncio
 from azure.mgmt.network import NetworkManagementClient
+from azure.mgmt.frontdoor import FrontDoorManagementClient  # Add Front Door client
+from azure.mgmt.trafficmanager import TrafficManagerManagementClient  # Add Traffic Manager client
 from azure.core.exceptions import HttpResponseError
 
-def fetch_networking_details(credential, subscription_id, resources_list):
-    """Fetches VNet, subnet, NSG, peering, Firewall, Public IP, Gateways, DDoS plans for a subscription."""
+async def fetch_networking_details(credential, subscription_id, resources_list):
+    """Fetches VNet, subnet, NSG, peering, Firewall, Public IP, Gateways, DDoS plans, Route Tables, App Gateways (WAF), WAF Policies for a subscription."""
     logging.info(f"[{subscription_id}] Fetching networking details...")
     network_client = NetworkManagementClient(credential, subscription_id)
+    
+    # Initialize specific clients for Front Door and Traffic Manager
+    frontdoor_client = FrontDoorManagementClient(credential, subscription_id)
+    traffic_manager_client = TrafficManagerManagementClient(credential, subscription_id)
+
     network_data = {
         "vnets": [],
         "subnets": [],
@@ -18,7 +26,12 @@ def fetch_networking_details(credential, subscription_id, resources_list):
         "ddos_protection_plans": [],
         "private_endpoints": [],
         "private_dns_zones": [],
-        # TODO: Add other types like app gateways, priv dns, route tables etc. later
+        "route_tables": [],
+        "application_gateways": [],
+        "waf_policies": [],
+        "load_balancers": [],
+        "front_doors": [],  # Add Front Door list
+        "traffic_managers": []  # Add Traffic Manager list
     }
 
     # Get unique resource group names from the resources list for efficient GW listing
@@ -297,6 +310,179 @@ def fetch_networking_details(credential, subscription_id, resources_list):
             logging.warning(f"[{subscription_id}] Could not list Private DNS Zones (Check Permissions?): {e.message}")
         except Exception as e:
             logging.error(f"[{subscription_id}] Unexpected error fetching Private DNS Zones: {e}")
+
+        # --- Fetch Route Tables (New) ---
+        try:
+            route_tables = list(network_client.route_tables.list_all())
+            logging.info(f"[{subscription_id}] Found {len(route_tables)} Route Tables.")
+            for rt in route_tables:
+                routes_info = []
+                if rt.routes:
+                    for route in rt.routes:
+                        routes_info.append({
+                            "name": route.name,
+                            "address_prefix": route.address_prefix,
+                            "next_hop_type": str(route.next_hop_type), # Enum
+                            "next_hop_ip_address": route.next_hop_ip_address
+                        })
+                rt_details = {
+                    "id": rt.id,
+                    "name": rt.name,
+                    "location": rt.location,
+                    "resource_group": rt.id.split('/')[4],
+                    "routes": routes_info,
+                    "disable_bgp_route_propagation": rt.disable_bgp_route_propagation,
+                    "tags": rt.tags
+                }
+                network_data["route_tables"].append(rt_details)
+        except HttpResponseError as e:
+            logging.warning(f"[{subscription_id}] Could not list Route Tables (Check Permissions?): {e.message}")
+        except Exception as e:
+            logging.error(f"[{subscription_id}] Unexpected error fetching Route Tables: {e}")
+
+        # --- Fetch Application Gateways (for WAF Config) (New) ---
+        try:
+            app_gateways = list(network_client.application_gateways.list_all())
+            logging.info(f"[{subscription_id}] Found {len(app_gateways)} Application Gateways.")
+            for ag in app_gateways:
+                waf_config = None
+                if ag.web_application_firewall_configuration:
+                    waf_conf = ag.web_application_firewall_configuration
+                    waf_config = {
+                        "enabled": waf_conf.enabled,
+                        "firewall_mode": str(waf_conf.firewall_mode), # Enum (Detection/Prevention)
+                        "rule_set_type": waf_conf.rule_set_type,
+                        "rule_set_version": waf_conf.rule_set_version,
+                        "disabled_rule_groups": [rg.rule_group_name for rg in waf_conf.disabled_rule_groups] if waf_conf.disabled_rule_groups else [],
+                        "request_body_check": waf_conf.request_body_check,
+                        "max_request_body_size_in_kb": waf_conf.max_request_body_size_in_kb,
+                        "file_upload_limit_in_mb": waf_conf.file_upload_limit_in_mb
+                    }
+
+                ag_details = {
+                    "id": ag.id,
+                    "name": ag.name,
+                    "location": ag.location,
+                    "resource_group": ag.id.split('/')[4],
+                    "sku_name": ag.sku.name if ag.sku else "Unknown",
+                    "sku_tier": ag.sku.tier if ag.sku else "Unknown",
+                    "waf_configuration": waf_config, # WAF info
+                    "firewall_policy_id": ag.firewall_policy.id if ag.firewall_policy else None, # Link to WAF Policy
+                    "tags": ag.tags
+                }
+                network_data["application_gateways"].append(ag_details)
+        except HttpResponseError as e:
+            logging.warning(f"[{subscription_id}] Could not list Application Gateways (Check Permissions?): {e.message}")
+        except Exception as e:
+            logging.error(f"[{subscription_id}] Unexpected error fetching Application Gateways: {e}")
+
+        # --- Fetch Web Application Firewall Policies (WAF Policies) (New) ---
+        try:
+            waf_policies = list(network_client.web_application_firewall_policies.list_all())
+            logging.info(f"[{subscription_id}] Found {len(waf_policies)} WAF Policies.")
+            for policy in waf_policies:
+                 policy_settings = None
+                 if policy.policy_settings:
+                     ps = policy.policy_settings
+                     policy_settings = {
+                         "state": str(ps.state), # Enum (Enabled/Disabled)
+                         "mode": str(ps.mode), # Enum (Prevention/Detection)
+                         "request_body_check": ps.request_body_check,
+                         "max_request_body_size_in_kb": ps.max_request_body_size_in_kb,
+                         "file_upload_limit_in_mb": ps.file_upload_limit_in_mb
+                     }
+                 managed_rules = None
+                 if policy.managed_rules:
+                     mr = policy.managed_rules
+                     managed_rules = {
+                        "managed_rule_sets": [
+                             {"rule_set_type": mrs.rule_set_type, "rule_set_version": mrs.rule_set_version}
+                             for mrs in mr.managed_rule_sets
+                         ] if mr.managed_rule_sets else []
+                     }
+
+                 policy_details = {
+                     "id": policy.id,
+                     "name": policy.name,
+                     "location": policy.location,
+                     "resource_group": policy.id.split('/')[4],
+                     "policy_settings": policy_settings,
+                     "managed_rules": managed_rules,
+                     # Links to associated resources (App Gateways, Front Doors, CDNs)
+                     "application_gateway_ids": [ag.id for ag in policy.application_gateways] if policy.application_gateways else [],
+                     # "http_listener_ids": [l.id for l in policy.http_listeners] if policy.http_listeners else [], # Typically for Front Door Classic
+                     # "path_based_rule_ids": [p.id for p in policy.path_based_rules] if policy.path_based_rules else [], # Typically for Front Door Classic
+                     "tags": policy.tags
+                 }
+                 network_data["waf_policies"].append(policy_details)
+        except HttpResponseError as e:
+            logging.warning(f"[{subscription_id}] Could not list WAF Policies (Check Permissions?): {e.message}")
+        except Exception as e:
+            logging.error(f"[{subscription_id}] Unexpected error fetching WAF Policies: {e}")
+
+        # --- Fetch Load Balancers ---
+        try:
+            load_balancers = list(network_client.load_balancers.list_all())
+            logging.info(f"[{subscription_id}] Found {len(load_balancers)} Load Balancers.")
+            for lb in load_balancers:
+                lb_details = {
+                    "id": lb.id,
+                    "name": lb.name,
+                    "location": lb.location,
+                    "resource_group": lb.id.split('/')[4],
+                    "sku": lb.sku.name if lb.sku else "Unknown",
+                    "tags": lb.tags
+                }
+                network_data["load_balancers"].append(lb_details)
+        except HttpResponseError as e:
+            logging.warning(f"[{subscription_id}] Could not list Load Balancers (Check Permissions?): {e.message}")
+        except Exception as e:
+            logging.error(f"[{subscription_id}] Unexpected error fetching Load Balancers: {e}")
+
+        # --- Fetch Front Doors (Classic) ---
+        try:
+            front_doors = list(frontdoor_client.front_doors.list())
+            logging.info(f"[{subscription_id}] Found {len(front_doors)} Front Door instances.")
+            for fd in front_doors:
+                fd_details = {
+                    "id": fd.id,
+                    "name": fd.name,
+                    "resource_group": fd.id.split('/')[4],
+                    "frontend_endpoints": [ep.host_name for ep in fd.frontend_endpoints] if fd.frontend_endpoints else [],
+                    "backend_pools": [pool.name for pool in fd.backend_pools] if fd.backend_pools else [],
+                    "routing_rules": [rule.name for rule in fd.routing_rules] if fd.routing_rules else [],
+                    "enabled_state": str(fd.enabled_state) if fd.enabled_state else None,
+                    "tags": fd.tags
+                }
+                network_data["front_doors"].append(fd_details)
+        except Exception as fd_e:
+            logging.warning(f"[{subscription_id}] Could not list Front Door instances: {fd_e}")
+
+        # --- Fetch Traffic Manager Profiles ---
+        try:
+            traffic_managers = list(traffic_manager_client.profiles.list_by_subscription())
+            logging.info(f"[{subscription_id}] Found {len(traffic_managers)} Traffic Manager profiles.")
+            for tm in traffic_managers:
+                tm_details = {
+                    "id": tm.id,
+                    "name": tm.name,
+                    "resource_group": tm.id.split('/')[4],
+                    "profile_status": str(tm.profile_status) if tm.profile_status else None,
+                    "routing_method": str(tm.traffic_routing_method) if tm.traffic_routing_method else None,
+                    "dns_config": {
+                        "relative_name": tm.dns_config.relative_name if tm.dns_config else None,
+                        "ttl": tm.dns_config.ttl if tm.dns_config else None
+                    } if tm.dns_config else None,
+                    "monitor_config": {
+                        "protocol": str(tm.monitor_config.protocol) if tm.monitor_config else None,
+                        "port": tm.monitor_config.port if tm.monitor_config else None,
+                        "path": tm.monitor_config.path if tm.monitor_config else None
+                    } if tm.monitor_config else None,
+                    "tags": tm.tags
+                }
+                network_data["traffic_managers"].append(tm_details)
+        except Exception as tm_e:
+            logging.warning(f"[{subscription_id}] Could not list Traffic Manager profiles: {tm_e}")
 
     except HttpResponseError as e:
         if e.status_code == 403:

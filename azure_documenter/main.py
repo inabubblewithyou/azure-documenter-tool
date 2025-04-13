@@ -7,9 +7,12 @@ from datetime import datetime, timezone # Add timezone import
 import time  # For local timezone handling
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.resource import SubscriptionClient, ResourceManagementClient
-from azure.mgmt.resource.subscriptions import SubscriptionClient # Already imported, but clarify usage
+from azure.mgmt.resource.subscriptions import SubscriptionClient
 from azure.mgmt.loganalytics import LogAnalyticsManagementClient
 from azure.core.exceptions import HttpResponseError
+import asyncio # Add asyncio import
+import platform
+from typing import Dict, List, Tuple, Any
 
 # --- Rich Import ---
 try:
@@ -29,15 +32,23 @@ except ImportError:
 
 # Import fetchers
 from fetchers.resources import fetch_resources, fetch_app_service_details
+from fetchers.compute import fetch_all_vm_details
 from fetchers.network import fetch_networking_details
-from fetchers.security import fetch_security_details
-from fetchers.costs import fetch_cost_details
-from fetchers.governance import fetch_governance_details
-from fetchers.identity import fetch_service_principal_summary
+from fetchers.security import fetch_security_details, fetch_jit_policies
+from fetchers.costs import fetch_cost_details, fetch_detailed_cost_report
+from fetchers.governance import fetch_governance_details, fetch_management_groups
+from fetchers.identity import fetch_service_principal_summary, fetch_custom_roles, fetch_tenant_details
+from fetchers.monitor import fetch_monitoring_details
+from fetchers.keyvault import fetch_key_vaults, fetch_key_vault_certificates
+from fetchers.web import fetch_app_service_details # Fetcher for app services and settings
+from fetchers.scaling import fetch_autoscale_settings 
+from fetchers.database import fetch_database_details
+from fetchers.storage import fetch_storage_details
+from fetchers.ai_services import fetch_ai_services
 
 # Import generators
 from generators.markdown_writer import generate_markdown_report
-from generators.diagram_generator import generate_all_diagrams
+from generators.diagram_generator import generate_all_diagrams, generate_tenant_network_diagram
 from generators.html_exporter import export_markdown_to_html
 from generators.llm_writer import enhance_report_with_llm # Import LLM writer
 from generators.design_document_writer import generate_design_document # Added import
@@ -261,132 +272,262 @@ def save_raw_data(data, filename_prefix, timestamp_str):
         logging.error(f"Failed to save raw data to {filepath}: {e}")
         return None
 
-def main():
-    # Parse arguments here, then call main with args
-    parser = argparse.ArgumentParser(description="Azure Infrastructure Documenter Tool")
-    parser.add_argument(
-        "--mode",
-        choices=["Audit", "Design"],
-        default="Audit",
-        help="Specify the output mode: Audit (technical details) or Design (summaries and diagrams)."
-    )
-    # Add delta comparison argument
-    parser.add_argument(
-        "--compare",
-        nargs=2,
-        metavar=("TIMESTAMP1", "TIMESTAMP2"),
-        help="Compare two previous audit runs using their timestamps (YYYYMMDD_HHMMSS format). Skips new audit."
-    )
-    # Add a flag to skip the interactive menu and audit all subscriptions
-    parser.add_argument(
-        "--all-subscriptions",
-        action="store_true",
-        help="Audit all accessible subscriptions without interactive selection."
-    )
-    # Add silent mode flag
-    parser.add_argument(
-        "--silent",
-        action="store_true",
-        help="Run in silent mode without printing to console. Output is still logged to file."
-    )
+async def process_subscription(credential, subscription_info, tenant_sp_summary):
+    """Fetches all data for a single subscription."""
+    sub_id = subscription_info['id']
+    sub_name = subscription_info['display_name']
+    if not SILENT_MODE: rprint(f"\n[bold magenta]--- Processing Subscription: {sub_name} ({sub_id}) ---[/bold magenta]")
+    logging.info(f"Processing Subscription: {sub_name} ({sub_id}) START")
+
+    subscription_data = { "subscription_info": subscription_info } # Start with basic info
     
+    # Wrap fetches in try/except to allow continuing if one fetcher fails
+    try:
+        if not SILENT_MODE: rprint("  Fetching Resources...")
+        resources = await fetch_resources(credential, sub_id)
+        subscription_data["resources"] = resources
+    except Exception as e:
+        logging.error(f"[{sub_id}] Failed during fetch_resources: {e}", exc_info=True)
+        subscription_data["error"] = f"fetch_resources failed: {e}"
+        return sub_id, subscription_data
+
+    # --- Fetch Resource Groups --- 
+    try:
+        if not SILENT_MODE: rprint("  Fetching Resource Groups...")
+        resource_client = ResourceManagementClient(credential, sub_id)
+        rg_list = list(resource_client.resource_groups.list())
+        subscription_data["resource_groups"] = [
+            {
+                "id": rg.id,
+                "name": rg.name,
+                "location": rg.location,
+                "managed_by": rg.managed_by,
+                "tags": rg.tags
+            } for rg in rg_list
+        ]
+        logging.info(f"[{sub_id}] Found {len(rg_list)} resource groups.")
+    except Exception as e:
+        logging.error(f"[{sub_id}] Failed during resource group fetch: {e}", exc_info=True)
+        subscription_data["resource_groups"] = {"error": str(e)}
+
+    # --- Other Fetchers (Make them async and await them) ---
+    # Initial batch of fetchers
+    fetch_tasks = {
+        "compute": fetch_all_vm_details(credential, sub_id),
+        "networking": fetch_networking_details(credential, sub_id, resources),
+        "security": fetch_security_details(credential, sub_id),
+        "costs": fetch_cost_details(credential, sub_id),
+        "governance": fetch_governance_details(credential, sub_id),
+        "monitoring": fetch_monitoring_details(credential, sub_id),
+        "key_vaults": fetch_key_vaults(credential, sub_id),
+        "web_details": fetch_app_service_details(credential, sub_id),
+        "scaling": fetch_autoscale_settings(credential, sub_id),
+        "database": fetch_database_details(credential, sub_id),
+        "storage": fetch_storage_details(credential, sub_id),
+        "ai_services": fetch_ai_services(credential, sub_id)  # Add AI services fetcher
+    }
+
+    results = await asyncio.gather(*fetch_tasks.values(), return_exceptions=True)
+    
+    fetch_keys = list(fetch_tasks.keys())
+    for i, result in enumerate(results):
+        key = fetch_keys[i]
+        if isinstance(result, Exception):
+            logging.error(f"[{sub_id}] Failed during {key} fetch: {result}", exc_info=True)
+            subscription_data["error"] = subscription_data.get("error", "") + f"; {key} fetch failed: {result}"
+            subscription_data[key] = {"error": str(result)}
+        else:
+            subscription_data[key] = result
+
+    # --- Fetch Key Vault Certificates (After fetching vaults) ---
+    if "key_vaults" in subscription_data and not isinstance(subscription_data["key_vaults"], dict):
+        vaults_list = subscription_data["key_vaults"]
+        if vaults_list:
+            cert_tasks = []
+            vault_uri_map = {}
+            for index, vault_info in enumerate(vaults_list):
+                if isinstance(vault_info, dict) and vault_info.get("vault_uri"):
+                    vault_uri = vault_info["vault_uri"]
+                    cert_tasks.append(fetch_key_vault_certificates(credential, vault_uri))
+                    vault_uri_map[index] = vault_uri
+                else:
+                    logging.warning(f"[{sub_id}] Skipping certificate fetch for vault entry due to missing URI: {vault_info}")
+
+            if cert_tasks:
+                cert_results = await asyncio.gather(*cert_tasks, return_exceptions=True)
+                for i, cert_result in enumerate(cert_results):
+                    original_vault_uri = vault_uri_map.get(i)
+                    if original_vault_uri:
+                        target_vault = next((v for v in vaults_list if isinstance(v, dict) and v.get("vault_uri") == original_vault_uri), None)
+                        if target_vault:
+                            if isinstance(cert_result, Exception):
+                                error_msg = f"Failed fetching certificates for vault {original_vault_uri}: {cert_result}"
+                                logging.error(f"[{sub_id}] {error_msg}", exc_info=cert_result)
+                                target_vault["certificates"] = {"error": error_msg}
+                                subscription_data["error"] = subscription_data.get("error", "") + f"; Cert fetch failed for {original_vault_uri}"
+                            elif isinstance(cert_result, dict):
+                                target_vault["certificates"] = cert_result.get("certificates", [])
+                                if cert_result.get("error"):
+                                    target_vault["certificate_fetch_error"] = cert_result["error"]
+                                    logging.warning(f"[{sub_id}] Error reported within certificate fetch result for {original_vault_uri}: {cert_result['error']}")
+                            else:
+                                logging.warning(f"[{sub_id}] Unexpected result type for certificate fetch for {original_vault_uri}: {type(cert_result)}")
+                                target_vault["certificates"] = {"error": "Unexpected result type"}
+                        else:
+                            logging.warning(f"[{sub_id}] Could not find original vault entry for URI {original_vault_uri} after fetching certificates.")
+                    else:
+                        logging.warning(f"[{sub_id}] Could not map certificate result index {i} back to a vault URI.")
+
+    # --- Merge detailed VM info into the main resources list ---
+    try:
+        if ("resources" in subscription_data and "compute" in subscription_data and
+            isinstance(subscription_data["resources"], list) and
+            isinstance(subscription_data["compute"], dict) and
+            "error" not in subscription_data["compute"] and
+            "vms" in subscription_data["compute"] and
+            isinstance(subscription_data["compute"]["vms"], list)):
+
+            vm_list_from_fetcher = subscription_data["compute"]["vms"]
+            vm_details_map = {vm.get("id"): vm for vm in vm_list_from_fetcher if isinstance(vm, dict) and vm.get("id")}
+            
+            if not vm_details_map and vm_list_from_fetcher:
+                logging.debug(f"[{sub_id}] No valid VM details found to merge with resources list.")
+            
+            # Update resources with VM details where applicable
+            for resource in subscription_data["resources"]:
+                if isinstance(resource, dict) and resource.get("type") == "Microsoft.Compute/virtualMachines":
+                    vm_id = resource.get("id")
+                    if vm_id and vm_id in vm_details_map:
+                        resource.update(vm_details_map[vm_id])
+
+            merged_count = len(vm_details_map)
+            logging.info(f"[{sub_id}] Merged details for {merged_count} VMs into the main resource list.")
+
+    except Exception as merge_e:
+        logging.error(f"[{sub_id}] Failed to merge VM details into resource list: {merge_e}", exc_info=True)
+
+    # --- Fetch JIT Policies ---
+    try:
+        jit_policies = await fetch_jit_policies(credential, sub_id)
+        if "security" in subscription_data and isinstance(subscription_data["security"], dict):
+            subscription_data["security"]["jit_policies"] = jit_policies
+        else:
+            subscription_data["jit_policies"] = jit_policies
+    except Exception as jit_e:
+        logging.error(f"[{sub_id}] Failed during JIT policies fetch: {jit_e}", exc_info=jit_e)
+        if "security" in subscription_data and isinstance(subscription_data["security"], dict):
+            subscription_data["security"]["jit_policies"] = {"error": str(jit_e)}
+        else:
+            subscription_data["jit_policies"] = {"error": str(jit_e)}
+
+    # --- Fetch Custom Roles ---
+    try:
+        custom_roles = await fetch_custom_roles(credential, sub_id)
+        subscription_data["identity"] = {
+            "service_principal_summary": tenant_sp_summary,
+            "custom_roles": custom_roles
+        }
+    except Exception as id_e:
+        logging.error(f"[{sub_id}] Failed during identity fetch (SP Summary or Custom Roles): {id_e}", exc_info=id_e)
+        subscription_data["identity"] = {"error": str(id_e)}
+        if "error" not in subscription_data:
+            subscription_data["error"] = f"identity fetch failed: {id_e}"
+
+    if not SILENT_MODE: rprint(f"[green]--> Finished processing {sub_name}.[/green]")
+    logging.info(f"Processing Subscription: {sub_name} ({sub_id}) END")
+    return sub_id, subscription_data
+
+async def main():
+    global SILENT_MODE # Allow modifying the global flag
+
+    # Argument Parsing
+    parser = argparse.ArgumentParser(description="Azure Documentation Tool")
+    parser.add_argument("--mode", choices=["Audit", "Design", "Compare"], default="Audit", help="Specify the output mode: Audit, Design, or Compare.")
+    parser.add_argument("--compare", nargs=2, metavar=("TIMESTAMP1", "TIMESTAMP2"), help="Compare two previous audit runs using timestamps (YYYYMMDD_HHMMSS format). Used with --mode Compare.")
+    parser.add_argument("--all-subscriptions", action="store_true", help="Audit all accessible subscriptions without interactive selection.")
+    parser.add_argument("--silent", "-s", action="store_true", help="Run in silent mode (suppress console output, but still log to file).")
     args = parser.parse_args()
     
     # Set global silent mode flag
-    global SILENT_MODE
     SILENT_MODE = args.silent
     
-    # Configure logging for silent mode
+    # --- Configure Logging for Silent Mode ---
     if SILENT_MODE:
-        # Remove console handler in silent mode
-        for handler in logger.handlers[:]:
-            if isinstance(handler, logging.StreamHandler) and handler.stream == sys.stdout:
-                logger.removeHandler(handler)
+        # Remove console handler if it exists
+        if console_handler and console_handler in logger.handlers:
+             logger.removeHandler(console_handler)
+        # Ensure Rich console is also silenced if it was initialized
+        global console
+        if console: 
+             console.quiet = True 
+             console.file = open(os.devnull, 'w') # Redirect rich output to null
+    elif _RICH_AVAILABLE and console_handler not in logger.handlers: 
+         logger.addHandler(console_handler) # Re-add if not silent and was removed
+    # ---------------------------------------
+
+    # --- Handle Delta Comparison Mode (Restored) ---
+    if args.mode == "Compare":
+        if not args.compare:
+            if not SILENT_MODE: rprint("[red]Error: --compare requires two timestamps when using --mode Compare.[/red]")
+            logging.error("Compare mode selected without providing two timestamps via --compare.")
+            sys.exit(1)
         
-        # Make sure we still have a file handler to capture logs
-        log_dir = os.path.join(OUTPUT_BASE_DIR, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        file_handler = logging.FileHandler(os.path.join(log_dir, f"azure_documenter_{get_formatted_timestamp()}.log"))
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    
-    # --- Handle Delta Comparison Mode ---
-    if args.compare:
         timestamp1, timestamp2 = args.compare
-        if not SILENT_MODE:
-            # Use rich print for delta mode start
-            rprint(f"[bold yellow]Running in Delta Comparison mode:[/bold yellow] Comparing [cyan]{timestamp1}[/cyan] vs [cyan]{timestamp2}[/cyan]")
+        if not SILENT_MODE: rprint(f"[bold yellow]Running in Delta Comparison mode:[/bold yellow] Comparing [cyan]{timestamp1}[/cyan] vs [cyan]{timestamp2}[/cyan]")
         logging.info(f"Running in Delta Comparison mode: Comparing {timestamp1} vs {timestamp2}")
 
-        # Construct file paths
         file1 = os.path.join(DATA_DIR, f"azure_audit_raw_data_{timestamp1}.json")
         file2 = os.path.join(DATA_DIR, f"azure_audit_raw_data_{timestamp2}.json")
 
-        if not os.path.exists(file1):
-            if not SILENT_MODE:
-                print(f"Comparison file not found: {file1}")
-            logging.error(f"Comparison file not found: {file1}")
-            return
-        if not os.path.exists(file2):
-            if not SILENT_MODE:
-                print(f"Comparison file not found: {file2}")
-            logging.error(f"Comparison file not found: {file2}")
-            return
+        if not os.path.exists(file1) or not os.path.exists(file2):
+            if not SILENT_MODE: rprint(f"[red]Error: Comparison file(s) not found. Checked paths:\n - {file1}\n - {file2}[/red]")
+            logging.error(f"Comparison file(s) not found: {file1}, {file2}")
+            sys.exit(1)
 
-        if not SILENT_MODE:
-            print(f"Loading data from {file1} and {file2}...")
+        if not SILENT_MODE: rprint(f"Loading data from {file1} and {file2}...")
         logging.info(f"Loading data from {file1} and {file2}...")
         data1 = load_audit_data(file1)
         data2 = load_audit_data(file2)
         
         if data1 and data2:
-            if not SILENT_MODE:
-                print("Analyzing differences between the two audit files...")
-            logging.info("Analyzing differences between the two audit files...")
+            if not SILENT_MODE: rprint("Analyzing differences...")
+            logging.info("Analyzing differences...")
             delta = analyze_delta(data1, data2)
             
-            if not SILENT_MODE:
-                print("Generating delta report...")
+            if not SILENT_MODE: rprint("Generating delta report...")
             logging.info("Generating delta report...")
+            # Pass base output dir for consistency
             delta_report_path = generate_delta_report(delta, timestamp1, timestamp2, OUTPUT_BASE_DIR)
             
             if delta_report_path:
-                # Generate HTML version of the delta report
-                if not SILENT_MODE:
-                    print("Converting delta report to HTML...")
+                if not SILENT_MODE: rprint("Converting delta report to HTML...")
                 logging.info("Converting delta report to HTML...")
+                # Pass REPORT_DIR and base filename prefix
                 html_report_path = export_markdown_to_html(delta_report_path, REPORT_DIR, f"delta_{timestamp1}_vs_{timestamp2}")
                 
-                # Log paths to both reports for user convenience
                 if html_report_path:
                     if not SILENT_MODE:
-                        print(f"Delta reports generated:")
-                        print(f"  - Markdown: {delta_report_path}")
-                        print(f"  - HTML: {html_report_path}")
-                    logging.info(f"Delta reports generated:")
-                    logging.info(f"  - Markdown: {delta_report_path}")
-                    logging.info(f"  - HTML: {html_report_path}")
+                        rprint("[green]Delta reports generated:[/green]")
+                        rprint(f"  - Markdown: {delta_report_path}")
+                        rprint(f"  - HTML: {html_report_path}")
+                    logging.info(f"Delta reports generated: Markdown: {delta_report_path}, HTML: {html_report_path}")
                 else:
-                    if not SILENT_MODE:
-                        print(f"Delta report generated: {delta_report_path}")
+                    if not SILENT_MODE: rprint(f"[green]Delta report generated:[/green] {delta_report_path}")
                     logging.info(f"Delta report generated: {delta_report_path}")
             else:
-                if not SILENT_MODE:
-                    print("Failed to generate delta report.")
-                logging.error("Failed to generate delta report.")
+                if not SILENT_MODE: rprint("[yellow]Failed to generate delta report (or no differences found).[/yellow]")
+                logging.warning("Failed to generate delta report (or no differences found).")
         else:
-            if not SILENT_MODE:
-                print("Failed to load data for comparison.")
+            if not SILENT_MODE: rprint("[red]Failed to load data for comparison.[/red]")
             logging.error("Failed to load data for comparison.")
 
-        if not SILENT_MODE:
-            print("Azure Documenter Delta Comparison finished.")
+        if not SILENT_MODE: rprint("Azure Documenter Delta Comparison finished.")
         logging.info("Azure Documenter Delta Comparison finished.")
-        return # Exit after comparison
+        sys.exit(0) # Exit after comparison
+    # --- End Delta Comparison Mode ---
         
-    # --- Normal Audit Mode (if --compare is not used) ---
-    # Generate timestamp for this run (using local timezone)
-    run_timestamp = get_formatted_timestamp()
+    # --- Normal Audit/Design Mode ---
+    run_timestamp = get_formatted_timestamp() # Timestamp for this run
     if not SILENT_MODE:
         rprint(Panel(f"""Starting Azure Documenter
 Mode: [bold]{args.mode}[/bold]
@@ -394,419 +535,218 @@ Run ID: [cyan]{run_timestamp}[/cyan]""",
                      title="[bold blue]Azure Documenter[/bold blue]", 
                      subtitle="Starting Run", 
                      border_style="blue"))
-        rprint("[italic grey50]This Run ID can be used later with --compare to identify changes[/italic grey50]")
     logging.info(f"Starting Azure Documenter in {args.mode} mode (Run ID: {run_timestamp}).")
 
     # --- Authentication ---
-    if not SILENT_MODE:
-        rprint("""
-[bold blue]Authenticating using DefaultAzureCredential...[/bold blue]""")
-    timestamp_str = get_formatted_timestamp()
-    if not SILENT_MODE:
-        print(f"Audit timestamp: {timestamp_str}")
-    logging.info(f"Audit timestamp: {timestamp_str}")
-
-    if not SILENT_MODE:
-        print("\nAuthenticating using DefaultAzureCredential...")
+    if not SILENT_MODE: rprint("[cyan]Attempting Azure authentication...[/cyan]")
+    logging.info("Attempting Azure authentication...")
     try:
         credential = DefaultAzureCredential()
-        subscription_client = SubscriptionClient(credential)
-        available_subscriptions = list(subscription_client.subscriptions.list())
-        # Test credential early by listing subscriptions
-        all_subscriptions = get_subscriptions(credential)
-    except Exception as e:
-        if not SILENT_MODE:
-            print(f"Authentication failed: {e}")
-        logging.critical(f"Authentication failed: {e}")
-        return
+        # Quick test: list tenants to validate credentials early
+        tenant_details_result = await fetch_tenant_details(credential)
+        tenant_id = tenant_details_result.get("tenant_id", "unknown_tenant")
+        error_value = tenant_details_result.get("error")
 
-    if not all_subscriptions:
-        if not SILENT_MODE:
-            print("No accessible subscriptions found. Exiting.")
-        logging.warning("No accessible subscriptions found. Exiting.")
-        return
+        # Refined Check: Exit if tenant_id is invalid OR if error_value is truthy (not None, not empty string)
+        if not tenant_id or tenant_id == "unknown_tenant" or error_value:
+             # Determine the message: Use error_value if it's truthy, otherwise use the generic message.
+             error_msg = error_value if error_value else "Could not determine tenant ID or credential validation failed."
+             if not SILENT_MODE: rprint(f"[bold red]Credential Error:[/bold red] {error_msg}")
+             logging.error(f"Credential Error: {error_msg}")
+             sys.exit(1)
+        
+        # If we reach here, tenant_id is valid and there's no blocking error
+        if not SILENT_MODE: rprint(f"[green]Credentials acquired for tenant: {tenant_id}[/green]")
+        logging.info(f"Credentials acquired for tenant: {tenant_id}")
 
-    # Select subscriptions unless --all-subscriptions is used
-    if args.all_subscriptions:
-        selected_subscriptions = all_subscriptions
-        if not SILENT_MODE:
-            rprint(f"[yellow]--all-subscriptions flag detected. Auditing all [bold]{len(selected_subscriptions)}[/bold] accessible subscriptions.[/yellow]")
-        logging.info(f"Auditing all {len(selected_subscriptions)} accessible subscriptions due to --all-subscriptions flag.")
-    else:
-        selected_subscriptions = select_subscriptions(all_subscriptions)
-
-    if not selected_subscriptions:
-        if not SILENT_MODE:
-            print("No subscriptions selected for audit. Exiting.")
-        logging.info("No subscriptions selected for audit. Exiting.")
-        return
-
-    # Fetch tenant-level info once (like Service Principals)
-    # We need the credential, which we have
-    service_principal_info = fetch_service_principal_summary(credential)
-
-    # --- Process selected subscriptions ---
-    all_subscription_data = {}
-    tenant_display_name = "Unknown Tenant" # Store display name (e.g., "Contoso Corp")
-    tenant_default_domain = "example.onmicrosoft.com" # Store default domain (e.g., "contoso.onmicrosoft.com")
-    first_sub = True
-
-    if not SILENT_MODE:
-        rprint(f"""
-[bold blue]Starting data fetch for {len(selected_subscriptions)} selected subscription(s)...[/bold blue]""")
-
-    for i, sub_info in enumerate(selected_subscriptions):
-        sub_id = sub_info['id']
-        sub_display_name = sub_info['display_name']
-        if not SILENT_MODE:
-            # Use simple styled print for subscription header to avoid Panel/Linter issues
-            rprint(f"\n[bold magenta]--- Processing Subscription {i+1}/{len(selected_subscriptions)}: {sub_display_name} ({sub_id}) ---[/bold magenta]")
-        logging.info(f"Processing Subscription: {sub_display_name} ({sub_id})")
-
-        # --- Attempt to fetch Tenant Info (only once) ---
-        if first_sub and sub_info.get('tenant_id'):
-            current_tenant_id = sub_info['tenant_id']
-            # Determine document version based on tenant ID BEFORE fetching details
-            document_version = get_next_version(current_tenant_id)
-            if not SILENT_MODE:
-                rprint(f"[blue]Determined Document Version for Tenant ({current_tenant_id}): {document_version}[/blue]")
-            
-            try:
-                tenants = list(subscription_client.tenants.list())
-                if tenants:
-                    # Find the tenant matching the current subscription's tenant_id
-                    current_tenant = next((t for t in tenants if t.tenant_id == current_tenant_id), None)
-                    if current_tenant:
-                        # Prioritize Display Name
-                        if current_tenant.display_name:
-                            tenant_display_name = current_tenant.display_name
-                            logging.info(f"Successfully fetched Tenant Display Name: {tenant_display_name}")
-                        else:
-                            tenant_display_name = f"{current_tenant_id} (No Display Name)" # Fallback if display name empty
-                            logging.warning(f"Tenant {current_tenant_id} found, but display_name property is missing or empty.")
-                        
-                        # Get Default Domain
-                        if current_tenant.default_domain:
-                            tenant_default_domain = current_tenant.default_domain
-                            logging.info(f"Successfully fetched Tenant Default Domain: {tenant_default_domain}")
-                        else:
-                            tenant_default_domain = f"{current_tenant_id}.onmicrosoft.com" # Educated guess fallback
-                            logging.warning(f"Tenant {current_tenant_id} found, but default_domain property is missing. Using fallback: {tenant_default_domain}")
-                    else:
-                        logging.warning(f"Could not find specific tenant match for ID {current_tenant_id} in tenants list.")
-                        tenant_display_name = f"{current_tenant_id} (Tenant ID)" # Fallback
-                        tenant_default_domain = f"{current_tenant_id}.onmicrosoft.com" # Fallback
-                else:
-                    logging.warning("subscription_client.tenants.list() returned no tenants.")
-                    tenant_display_name = f"{current_tenant_id} (Tenant ID)" # Fallback
-                    tenant_default_domain = f"{current_tenant_id}.onmicrosoft.com" # Fallback
-
-            except Exception as e:
-                logging.warning(f"Could not fetch tenant details using SubscriptionClient (Permissions? Error: {e}). Falling back to Tenant ID.")
-                tenant_display_name = f"{current_tenant_id} (Tenant ID)"
-                tenant_default_domain = f"{current_tenant_id}.onmicrosoft.com"
-            
-            first_sub = False # Don't try fetching again
-        elif first_sub: # Handle case where first sub has no tenant_id (shouldn't happen)
-            tenant_display_name = "Unknown Tenant"
-            tenant_default_domain = "unknown.onmicrosoft.com"
-            first_sub = False
-            logging.error("First subscription processed lacked a tenant_id.")
-
-        # Pass the determined tenant_display_name and tenant_default_domain to the subscription_info
-        sub_data = {
-            "subscription_info": {
-                "id": sub_id, 
-                "display_name": sub_display_name, 
-                "tenant_id": sub_info.get('tenant_id'), 
-                "state": str(sub_info.get('state')), 
-                "tenant_domain": tenant_default_domain, # Store domain per sub for potential use
-                "identity": {
-                    "service_principals": service_principal_info
-                }
-            },
-            "resources": [],
-            "networking": {},
-            "security": {},
-            "costs": {},
-            "governance": {},
-            "monitoring": {}
+        # --- Fetch Tenant-Level Data (Once) ---
+        if not SILENT_MODE: rprint("Fetching tenant-level information (Management Groups, SP Summary)...")
+        logging.info("Fetching tenant-level information...")
+        tenant_data_tasks = {
+             "management_groups": fetch_management_groups(credential),
+             "tenant_details": asyncio.sleep(0, result=tenant_details_result), # Use already fetched details
+             "sp_summary": fetch_service_principal_summary(credential) # Fetch SP summary here
         }
+        tenant_results = await asyncio.gather(
+            *tenant_data_tasks.values(),
+            return_exceptions=True
+        )
+        
+        # Process tenant-level results
+        processed_tenant_results = {}
+        tenant_fetch_errors = []
+        for i, key in enumerate(tenant_data_tasks.keys()):
+            result = tenant_results[i]
+            if isinstance(result, Exception):
+                error_msg = f"Failed to fetch tenant {key}: {result}"
+                logging.error(error_msg, exc_info=result)
+                tenant_fetch_errors.append(error_msg)
+                processed_tenant_results[key] = {"error": error_msg}
+            else:
+                processed_tenant_results[key] = result
+                logging.info(f"Successfully fetched tenant {key}.")
+        
+        # Make SP summary available outside this block
+        tenant_sp_summary = processed_tenant_results.get("sp_summary", {"error": "SP Summary fetch failed or was not attempted."})
+        
+        if tenant_fetch_errors and not SILENT_MODE:
+             rprint("[yellow]Warning: Failed to fetch some tenant-level data:[/yellow]")
+             for err in tenant_fetch_errors:
+                 rprint(f"  - {err}")
+        # --- End Tenant-Level Fetch ---
+        
+        # --- Get and Select Subscriptions ---
+        all_subscriptions = get_subscriptions(credential)
+        if args.all_subscriptions:
+            selected_subscriptions = all_subscriptions
+            if not SILENT_MODE: rprint(f"[yellow]--all-subscriptions flag detected. Processing [bold]{len(selected_subscriptions)}[/bold] subscription(s).[/yellow]")
+            logging.info(f"Processing all {len(selected_subscriptions)} subscriptions due to --all-subscriptions flag.")
+        else:
+            selected_subscriptions = select_subscriptions(all_subscriptions)
 
-        # Fetch base resources
-        if not SILENT_MODE: rprint("  Fetching base resources...")
-        resources_list = fetch_resources(credential, sub_id)
+        if not selected_subscriptions:
+            logging.warning("No subscriptions selected. Exiting.")
+            if not SILENT_MODE: rprint("[yellow]No subscriptions selected. Exiting.[/yellow]")
+            sys.exit(0)
 
-        # --- Extract Resource Group Names ---
-        resource_groups_in_sub = set()
-        if resources_list:
-            for resource in resources_list:
-                if resource.get('resource_group'):
-                    resource_groups_in_sub.add(resource.get('resource_group'))
-        resource_groups_in_sub = list(resource_groups_in_sub) # Convert to list if needed by fetchers
-        logging.info(f"[{sub_id}] Found {len(resource_groups_in_sub)} resource groups in subscription.")
-        # ------------------------------------
+        # --- Process Selected Subscriptions ---
+        if not SILENT_MODE: rprint(f"\nProcessing {len(selected_subscriptions)} selected subscription(s)...\n")
+        logging.info(f"Processing {len(selected_subscriptions)} selected subscription(s)...\n")
 
-        # --- Enhance Resources with App Service Details ---
-        enriched_resources = []
-        app_service_count = sum(1 for res in resources_list if res.get('type') == 'Microsoft.Web/sites') if resources_list else 0
-        if app_service_count > 0 and not SILENT_MODE: rprint(f"  Fetching details for {app_service_count} App Service(s)...")
-        for resource in resources_list:
-            if resource.get('type') == 'Microsoft.Web/sites':
-                resource_group = resource.get('resource_group')
-                app_name = resource.get('name')
-                if resource_group and app_name:
-                    logging.info(f"Found App Service '{app_name}'. Fetching details...")
-                    details = fetch_app_service_details(credential, sub_id, resource_group, app_name)
-                    resource['app_service_details'] = details # Add details to the resource dict
-                else:
-                    logging.warning(f"Could not determine RG or Name for App Service ID: {resource.get('id')}. Skipping detail fetch.")
-            enriched_resources.append(resource)
+        all_subscription_data = {}
+        tasks = []
+        for sub in selected_subscriptions:
+            # Pass the fetched tenant_sp_summary to each task
+            tasks.append(process_subscription(credential, sub, tenant_sp_summary))
 
-        sub_data['resources'] = enriched_resources
-        # --------------------------------------------------
-
-        # Fetch other details
-        if not SILENT_MODE: rprint("  Fetching networking details...")
-        sub_data['networking'] = fetch_networking_details(credential, sub_id, enriched_resources) 
-        if not SILENT_MODE: rprint("  Fetching security details...")
-        sub_data['security'] = fetch_security_details(credential, sub_id)
-        if not SILENT_MODE: rprint("  Fetching cost details...")
-        sub_data['costs'] = fetch_cost_details(credential, sub_id)
-        if not SILENT_MODE: rprint("  Fetching governance details...")
-        sub_data['governance'] = fetch_governance_details(credential, sub_id)
-
-        # Fetch monitoring details
-        if not SILENT_MODE: rprint("  Fetching monitoring details (Log Analytics)...")
-        try:
-            loganalytics_client = LogAnalyticsManagementClient(credential, sub_id)
-            workspaces = []
-            # Try listing by subscription first
-            try:
-                workspaces = list(loganalytics_client.workspaces.list())
-                logging.info(f"[{sub_id}] Found {len(workspaces)} Log Analytics Workspaces via subscription list.")
-            except HttpResponseError as sub_list_error:
-                logging.warning(f"[{sub_id}] Could not list Log Analytics Workspaces by subscription ({sub_list_error.message}). Falling back to listing by resource group.")
-                if resource_groups_in_sub:
-                    for rg_name in resource_groups_in_sub:
-                        try:
-                            rg_workspaces = list(loganalytics_client.workspaces.list_by_resource_group(resource_group_name=rg_name))
-                            if rg_workspaces: workspaces.extend(rg_workspaces)
-                        except Exception as rg_error:
-                            logging.warning(f"[{sub_id}] Failed listing LA Workspaces in RG '{rg_name}': {rg_error}")
-                else:
-                    logging.warning(f"[{sub_id}] Cannot list LA Workspaces by RG as no RGs were identified.")
+        # Run subscription processing concurrently
+        results = await asyncio.gather(*tasks)
+        for sub_id, data in results:
+            all_subscription_data[sub_id] = data
             
-            # Process workspaces
-            processed_workspaces = []
-            for ws in workspaces:
-                ws_details = {
-                    "id": ws.id,
-                    "name": ws.name,
-                    "location": ws.location,
-                    "resource_group": ws.id.split('/')[4],
-                    "sku": ws.sku.name if ws.sku else "Unknown",
-                    "retention_in_days": ws.retention_in_days,
-                    "tags": ws.tags,
-                    "solutions": [] # Placeholder for solutions
-                }
-                processed_workspaces.append(ws_details)
-            sub_data['monitoring']['log_analytics_workspaces'] = processed_workspaces
-            logging.info(f"[{sub_id}] Successfully processed {len(processed_workspaces)} Log Analytics Workspaces.")
-            if not SILENT_MODE: rprint(f"    Found {len(processed_workspaces)} Log Analytics Workspaces.")
-            
-        except ImportError:
-            logging.error(f"[{sub_id}] azure-mgmt-loganalytics library not found. Skipping Log Analytics fetch.")
-            if not SILENT_MODE: rprint("[yellow]    Skipping Log Analytics: Library not found.[/yellow]")
-        except HttpResponseError as la_error:
-            logging.warning(f"[{sub_id}] Authorization/API error fetching Log Analytics: {la_error.message}")
-            if not SILENT_MODE: rprint(f"[yellow]    Warning fetching Log Analytics: {la_error.message}[/yellow]")
-        except Exception as la_ex:
-            logging.error(f"[{sub_id}] Unexpected error fetching Log Analytics: {la_ex}")
-            if not SILENT_MODE: rprint(f"[red]    Error fetching Log Analytics: {la_ex}[/red]")
-
+    except Exception as e:
+        logging.error(f"Main processing failed: {e}")
         if not SILENT_MODE:
-            # Ensure triple quotes for the multi-line f-string below
-            rprint(f"""[bold green]--> Finished processing Subscription: {sub_display_name}[/bold green]
-""") # Add space after finishing
-        logging.info(f"Finished processing Subscription: {sub_display_name}")
+            rprint(f"[bold red]Main processing failed:[/bold red] {e}")
+        sys.exit(1)
 
-        all_subscription_data[sub_id] = sub_data
-        logging.info(f"Processing Subscription: {sub_display_name} ({sub_id}) END")
+    # --- Add Management Group Data to the final dict (for saving) ---
+    final_audit_data_to_save = { 
+         # Add run details for context in the JSON file
+         "run_details": {
+             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+             "timestamp_local": run_timestamp, 
+             "mode": args.mode,
+             "version": get_next_version(tenant_id),
+             "tenant_id": tenant_id, # Use the determined tenant_id
+             "tenant_display_name": processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant"), # Use the potentially Graph-fetched name
+             "selected_subscription_ids": [sub['id'] for sub in selected_subscriptions],
+         },
+         "management_groups": processed_tenant_results.get("management_groups", []),
+         "subscriptions": all_subscription_data # The main data keyed by sub ID
+     }
+    # --------------------------------------------------------------
 
-    if not SILENT_MODE:
-        rprint("[bold blue]All data fetching complete.[/bold blue]")
-    logging.info("All data fetching complete.")
+    # --- Save Raw Audit Data (JSON) ---
+    raw_data_filepath = save_raw_data(final_audit_data_to_save, "azure_audit_raw_data", run_timestamp)
 
-    # Save the raw data
-    raw_data_filepath = save_raw_data(all_subscription_data, "azure_audit_raw_data", timestamp_str)
-
-    # --- Report Generation (pass timestamp and version) ---
-    if not SILENT_MODE:
-        rprint("""
-[bold blue]Proceeding to report generation...[/bold blue]""")
+    # --- Report Generation ---
+    if not SILENT_MODE: rprint("[bold blue]Proceeding to report generation...")
     logging.info("Proceeding to report generation...")
 
-    # Generate Diagrams (pass timestamp)
-    if not SILENT_MODE:
-        rprint("  Generating network diagrams...")
+    # Generate Diagrams 
+    if not SILENT_MODE: rprint("  Generating network diagrams...")
     logging.info("Generating diagrams...")
+    # Pass the subscription data dict directly
     generated_diagram_paths = generate_all_diagrams(all_subscription_data, DIAGRAM_DIR, run_timestamp)
 
-    # Generate Markdown Report (pass timestamp and version)
-    generated_report_path = None # Initialize path
-
-    # Determine tenant_id for saving version (use the one from the first valid sub)
-    final_tenant_id = None
-    if selected_subscriptions and selected_subscriptions[0].get('tenant_id'):
-        final_tenant_id = selected_subscriptions[0]['tenant_id']
-    else:
-        logging.error("Could not determine Tenant ID after processing subscriptions. Cannot save version.")
-
+    # --- Generate Markdown Report (Audit or Design) ---
+    generated_report_path = None 
     if args.mode == "Design":
-        if not SILENT_MODE:
-            rprint(f"  Generating [bold]{args.mode}[/bold] document...")
+        if not SILENT_MODE: rprint(f"  Generating [bold]{args.mode}[/bold] document...")
         logging.info("Generating design document...")
-        # Call the new design document generator
         generated_report_path = generate_design_document(
-            all_subscription_data,
+            all_subscription_data, # Pass ONLY the subscription data dict
             OUTPUT_BASE_DIR,
-            tenant_display_name=tenant_display_name, # Pass Display Name
-            tenant_default_domain=tenant_default_domain, # Pass Domain Name
-            document_version=document_version, # Pass Version
+            processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant"),
+            processed_tenant_results.get("tenant_details", {}).get("default_domain", "unknown.onmicrosoft.com"),
+            get_next_version(tenant_id),
+            management_group_data=processed_tenant_results.get("management_groups", []), # Pass MG data separately
             diagram_paths=generated_diagram_paths,
             timestamp_str=run_timestamp,
             silent_mode=SILENT_MODE
         )
     else: # Default to Audit mode
-        if not SILENT_MODE:
-            rprint(f"  Generating [bold]{args.mode}[/bold] report...")
+        if not SILENT_MODE: rprint(f"  Generating [bold]{args.mode}[/bold] report...")
         logging.info("Generating audit report...")
-        # Call the original markdown generator
+        # Pass the FINAL combined data structure
         generated_report_path = generate_markdown_report(
-            all_subscription_data,
+            final_audit_data_to_save, # Use the dict with MG data included
             OUTPUT_BASE_DIR,
-            tenant_display_name=tenant_display_name, # Pass Display Name
-            tenant_default_domain=tenant_default_domain, # Pass Domain Name (though maybe not used in Audit)
-            document_version=document_version, # Pass Version
+            processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant"), 
+            processed_tenant_results.get("tenant_details", {}).get("default_domain", "unknown.onmicrosoft.com"), 
+            get_next_version(tenant_id), 
             diagram_paths=generated_diagram_paths,
             timestamp_str=run_timestamp,
             silent_mode=SILENT_MODE
         )
+    # ----------------------------------------------------
 
-    # --- Enhance Report with LLM (Optional, based on config) ---
+    # --- LLM Enhancement (Disabled by default now) ---
     llm_enhanced_report_path = None
-    if generated_report_path and config.LLM_PROVIDER and config.LLM_API_KEY and config.LLM_MODEL:
-        if not SILENT_MODE:
-            rprint(f"  Enhancing {args.mode} document with LLM ([cyan]{config.LLM_PROVIDER}[/cyan])...")
-        logging.info(f"Enhancing {args.mode} document with LLM ({config.LLM_PROVIDER})...")
-        # Pass the correct base report path to the enhancer
-        llm_enhanced_report_path = enhance_report_with_llm(
-            generated_report_path, # Use the path generated above
-            all_subscription_data,
-            args.mode # Pass the mode to the LLM enhancer
-        )
-        # Update report path if enhancement was successful
-        if llm_enhanced_report_path:
-            if not SILENT_MODE:
-                rprint(f"  LLM enhancement complete. Enhanced report: [cyan]{llm_enhanced_report_path}[/cyan]")
-            logging.info(f"LLM enhancement complete. Enhanced report: {llm_enhanced_report_path}")
-            # Use the enhanced path for HTML conversion etc.
-            final_report_path = llm_enhanced_report_path 
-        else:
-            if not SILENT_MODE:
-                rprint("[yellow]  LLM enhancement failed or was skipped. Using original report.[/yellow]")
-            logging.warning("LLM enhancement failed or skipped. Using original report.")
-            final_report_path = generated_report_path # Fall back to original
-    else:
-        if generated_report_path: # Only log if a report was actually generated
-            if not SILENT_MODE:
-                rprint("[yellow]  LLM enhancement skipped (LLM not configured).[/yellow]")
-            logging.info("LLM enhancement skipped (LLM not configured).")
-        final_report_path = generated_report_path # Use original if LLM not configured
+    # Keep the code structure but effectively disable unless config is explicitly set
+    # if generated_report_path and config.LLM_PROVIDER != "none":
+    #    # ... LLM enhancement code ...
+    #    final_report_path = llm_enhanced_report_path or generated_report_path
+    # else:
+    #     final_report_path = generated_report_path 
+    final_report_path = generated_report_path # Use the generated path directly
+    # ---------------------------------------------------
 
-    # --- Generate HTML Report (Pass Version) ---
-    html_report_path = None # Initialize
+    # --- Generate HTML Report ---
+    html_report_path = None
     if final_report_path:
-        if not SILENT_MODE:
-            rprint("  Converting report to HTML...")
+        if not SILENT_MODE: rprint("  Converting report to HTML...")
         logging.info("Converting report to HTML...")
-        # Determine filename prefix based on mode and enhancement
         html_filename_prefix = f"azure_{args.mode.lower()}_report"
-        if llm_enhanced_report_path:
-            html_filename_prefix += "_llm_enhanced"
-        
         html_report_path = export_markdown_to_html(
             final_report_path,
             REPORT_DIR,
-            tenant_display_name=tenant_display_name, # Pass Display Name
-            tenant_default_domain=tenant_default_domain, # Pass Domain Name
-            document_version=document_version, # Pass Version
-            timestamp_str=run_timestamp, # Pass the pure timestamp 
+            tenant_display_name=processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant"), 
+            tenant_default_domain=processed_tenant_results.get("tenant_details", {}).get("default_domain", "unknown.onmicrosoft.com"), 
+            document_version=get_next_version(tenant_id), 
+            timestamp_str=run_timestamp, 
             silent_mode=SILENT_MODE
         )
 
-        # Log paths for user convenience using rich print
         if not SILENT_MODE:
-            rprint(f"""
-[bold green]{args.mode} Documentation Generation Complete:[/bold green]""")
-            if raw_data_filepath: rprint(f"  - Raw Data JSON: [cyan]{raw_data_filepath}[/cyan]")
-            
-            if final_report_path == llm_enhanced_report_path and llm_enhanced_report_path:
-                rprint(f"  - Original Markdown Report: [cyan]{generated_report_path}[/cyan]") 
-                rprint(f"  - LLM Enhanced Markdown Report: [cyan]{final_report_path}[/cyan]")
-            elif final_report_path:
-                rprint(f"  - Markdown Report: [cyan]{final_report_path}[/cyan]")
-            
-            # --- Improved Diagram Path Output --- 
-            if generated_diagram_paths:
-                rprint("  - Diagrams Generated:")
-                # Print tenant diagrams first
-                tenant_diagrams = generated_diagram_paths.get("tenant_diagrams", {})
-                for key, filename in tenant_diagrams.items():
-                    diagram_type = key.replace('_', ' ').title()
-                    rprint(f"    - Tenant {diagram_type}: [cyan]{filename}[/cyan]")
-                    
-                # Print subscription-specific diagrams (more readable)
-                for sub_id, diagrams in generated_diagram_paths.items():
-                    if sub_id == "tenant_diagrams": continue 
-                    
-                    sub_name = all_subscription_data.get(sub_id, {}).get("subscription_info", {}).get("display_name", sub_id)
-                    if isinstance(diagrams, dict):
-                         rprint(f"    - Subscription '[bold]{sub_name}[/bold]':")
-                         for key, filename in diagrams.items():
-                             diagram_type = key.replace('_', ' ').title()
-                             rprint(f"      - {diagram_type}: [cyan]{filename}[/cyan]")
-                    else:
-                        logging.warning(f"Unexpected diagram path format for subscription {sub_id}: {diagrams}")
-                        rprint(f"    - Subscription '[bold]{sub_name}[/bold]': (Diagram path format unexpected)")
-                        
-            if html_report_path:
-                rprint(f"  - HTML Report: [cyan]{html_report_path}[/cyan]")
+            rprint(f"\n[bold green]{args.mode} Documentation Generation Complete:[/bold green]")
 
-        # --- Simplified Final Log Message ---
-        diagram_log_msg = "Diagrams generated." if generated_diagram_paths else "No diagrams generated."
-        logging.info(f"Documentation generated. Raw data: {raw_data_filepath}, Report: {final_report_path}, {diagram_log_msg}, HTML: {html_report_path}")
+            if raw_data_filepath: rprint(f"  - Raw Data JSON: [cyan]{raw_data_filepath}[/cyan]")
+            if final_report_path: rprint(f"  - Markdown Report: [cyan]{final_report_path}[/cyan]")
+            # Diagram output logging needs adjustment based on generate_all_diagrams structure
+            if generated_diagram_paths:
+                 rprint("  - Diagrams: Check output in [cyan]{DIAGRAM_DIR}[/cyan]") # Simplified log
+            if html_report_path: rprint(f"  - HTML Report: [cyan]{html_report_path}[/cyan]")
+
+        logging.info(f"Documentation generated. Raw: {raw_data_filepath}, Report: {final_report_path}, HTML: {html_report_path}")
 
         # --- Save Version AFTER successful report generation ---
-        if final_tenant_id:
-            save_version(final_tenant_id, document_version)
-        else:
-            logging.error("Skipping version save because Tenant ID could not be confirmed.")
+        save_version(tenant_id, get_next_version(tenant_id))
 
     else:
-        if not SILENT_MODE:
-            rprint("[red]Skipping HTML conversion as report generation failed.[/red]")
-        logging.error("Markdown report generation failed or skipped.")
-        # Do NOT save version if report generation failed
-        logging.warning(f"Version {document_version} for tenant {final_tenant_id} was NOT saved because report generation failed.")
-    
+        if not SILENT_MODE: rprint("[red]Report generation failed or skipped. Skipping HTML conversion and version save.[/red]")
+        logging.error("Markdown report generation failed or skipped. Not saving version.")
+
+    # --- Finalization ---
     if not SILENT_MODE:
-        rprint(Panel(f"""Azure Documenter run finished.
-Run ID: [cyan]{run_timestamp}[/cyan]""", 
-                     title="[bold green]Run Complete[/bold green]", 
+        rprint(Panel(f"""Azure Documenter run finished.\nRun ID: [cyan]{run_timestamp}[/cyan]""", 
+                     title=" [bold green]Run Complete[/bold green] ", 
                      border_style="green"))
     logging.info(f"Azure Documenter run finished (Run ID: {run_timestamp}).")
 
 if __name__ == "__main__":
-    main() 
+    # Run the async main function
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main()) 

@@ -2,6 +2,22 @@ import os
 import logging
 from datetime import datetime, timezone
 import time
+import re
+
+
+
+# Import helper functions
+from .analysis_helpers import (
+    _get_management_group_hierarchy_summary,
+    _analyze_rg_naming_patterns,
+    _analyze_resource_lifecycle,
+    _analyze_ad_connect_status,
+    _analyze_rbac_approach,
+    _analyze_pim_status,
+    _analyze_managed_identity_usage,
+    _analyze_service_principals,
+    _analyze_lifecycle_policies
+)
 
 # Define output directories relative to the main script or a base path
 REPORT_DIR = "reports" 
@@ -24,43 +40,62 @@ def _generate_markdown_table(headers, data_rows):
     if not data_rows:
         return "_No data available._"
     
-    md = []
-    md.append(f"| {" | ".join(headers)} |")
-    md.append(f"|{":--|" * len(headers)}|")
-    for row in data_rows:
-        # Process each cell in the row
-        processed_cells = []
-        for i, item in enumerate(row):
-            # Convert to string if not already
-            cell_content = str(item) if item is not None else ""
-            
-            # Format resource IDs, connection strings, etc. as code for better readability
-            if isinstance(cell_content, str):
-                # Check for resource IDs, connection strings, or other long technical strings
-                if (cell_content.startswith('/subscriptions/') or 
-                    'microsoft.network' in cell_content.lower() or 
-                    'microsoft.compute' in cell_content.lower() or
-                    'connectionstring' in cell_content.lower() or
-                    cell_content.startswith('http') and len(cell_content) > 40):
-                    
-                    # If already wrapped in backticks, don't add more
-                    if not cell_content.startswith('`'):
-                        cell_content = f"`{cell_content}`"
-            
-            # Escape pipes using HTML entity and remove newlines
-            cell_content = cell_content.replace('|', '&#124;').replace('\n', ' ')
-            processed_cells.append(cell_content)
-            
-        md.append(f"| {" | ".join(processed_cells)} |")
+    def truncate_cell(content, max_length=60):
+        """Truncates cell content if it's too long."""
+        if len(content) > max_length and not content.startswith('`'):
+            return content[:max_length-3] + "..."
+        return content
     
-    # Add blank lines before and after the table for better Markdown parsing
-    return "\n" + "\n".join(md) + "\n"
+    def process_cell(content):
+        """Processes a cell's content for better formatting."""
+        if content is None:
+            return ""
+        
+        # Convert to string
+        content = str(content)
+        
+        # Handle resource IDs and technical strings
+        if (content.startswith('/subscriptions/') or 
+            'microsoft.' in content.lower() or 
+            'connectionstring' in content.lower() or
+            (content.startswith('http') and len(content) > 40)):
+            
+            # Extract meaningful part for display
+            if content.startswith('/subscriptions/'):
+                parts = content.split('/')
+                if len(parts) > 4:
+                    content = f"`.../{'/'.join(parts[-2:])}`"
+            elif not content.startswith('`'):
+                content = truncate_cell(content)
+                if len(content) > 40:
+                    content = f"`{content}`"
+        else:
+            content = truncate_cell(content)
+        
+        # Escape pipes and remove newlines
+        return content.replace('|', '&#124;').replace('\n', ' ')
+    
+    # Process headers
+    headers = [process_cell(h) for h in headers]
+    
+    md = []
+    md.append(f"| {' | '.join(headers)} |")
+    md.append(f"|{'|'.join(['---' for _ in headers])}|")
+    
+    # Process rows
+    for row in data_rows:
+        processed_cells = [process_cell(cell) for cell in row]
+        md.append(f"| {' | '.join(processed_cells)} |")
+    
+    # Add blank lines and CSS class for table wrapping
+    return "\n<div class='table-wrapper'>\n\n" + "\n".join(md) + "\n\n</div>\n"
 
-def _get_subscriptions_table(all_data):
+def _get_subscriptions_table(subscription_data):
     """Generates Markdown table for subscriptions."""
     headers = ["Subscription Name", "Subscription ID"]
     rows = []
-    for sub_id, data in all_data.items():
+    for sub_id, data in subscription_data.items():
+        # We expect data to be a dict here because main.py filtered it
         name = "Unknown Subscription (Error)"
         if "subscription_info" in data:
              name = data["subscription_info"].get("display_name", sub_id)
@@ -286,6 +321,7 @@ def _get_dns_details(all_data):
     private_zones_text = []
     custom_dns_text = []
     unique_custom_dns = set()
+    zones_by_type = {}  # Track zone types for summary
 
     for sub_id, data in all_data.items():
         if "error" in data or "networking" not in data: continue
@@ -293,9 +329,17 @@ def _get_dns_details(all_data):
         private_zones = data["networking"].get("private_dns_zones", [])
         for zone in private_zones:
              if isinstance(zone, dict):
-                links = ", ".join(zone.get('vnet_links', []))
-                private_zones_text.append(f"- **{zone.get('name', 'Unknown')}** (Sub: {sub_name}): Linked to VNets: {links if links else 'None'}")
+                zone_name = zone.get('name', 'Unknown')
+                links = zone.get('vnet_links', [])
+                links_str = ", ".join(links) if links else "None"
+                private_zones_text.append(f"- **{zone_name}** (Sub: {sub_name}): Linked to VNets: {links_str}")
+                
+                # Track zone types for summary
+                zone_type = zone_name.split('.', 1)[1] if '.' in zone_name else 'Other'
+                zones_by_type[zone_type] = zones_by_type.get(zone_type, 0) + 1
+                
              else: logging.warning(f"Skipping non-dictionary private zone in sub {sub_id}: {zone}")
+        
         vnets = data["networking"].get("vnets", [])
         for vnet in vnets:
             if isinstance(vnet, dict):
@@ -306,8 +350,26 @@ def _get_dns_details(all_data):
                     custom_dns_text.append(f"- VNet **{vnet_name}** (Sub: {sub_name}): `{dns_list}`")
                     unique_custom_dns.update(dns_servers)
             else: logging.warning(f"Skipping non-dictionary vnet for DNS check in sub {sub_id}: {vnet}")
-    private_zones_output = "\n".join(sorted(private_zones_text)) if private_zones_text else "_No Azure Private DNS Zones found linked to VNets._"
-    custom_dns_output = "\n".join(sorted(custom_dns_text)) if custom_dns_text else "_No VNets found using Custom DNS Servers._"
+    
+    # Generate the output with context
+    if private_zones_text:
+        zones_summary = "\n\n**Private DNS Zones Summary:**"
+        zones_summary += f"\n- Total Zones: {len(private_zones_text)}"
+        if zones_by_type:
+            zones_summary += "\n- Zone Types:"
+            for zone_type, count in sorted(zones_by_type.items()):
+                zones_summary += f"\n  - {zone_type}: {count} zone(s)"
+        private_zones_output = "\n".join(sorted(private_zones_text)) + zones_summary
+    else:
+        private_zones_output = "_No Azure Private DNS Zones found. This is expected if you're not using Azure Private Link or if private endpoints are not required for your workload._"
+    
+    if custom_dns_text:
+        custom_dns_output = "\n".join(sorted(custom_dns_text))
+        if unique_custom_dns:
+            custom_dns_output += f"\n\n**Unique DNS Servers:** {', '.join(sorted(unique_custom_dns))}"
+    else:
+        custom_dns_output = "_No VNets found using Custom DNS Servers. This is expected if you're using Azure-provided DNS or Private DNS Zones exclusively._"
+    
     return private_zones_output, custom_dns_output
 
 def _get_ddos_table(all_data):
@@ -337,6 +399,8 @@ def _get_private_endpoints_table(all_data):
     """Generates Markdown table for Private Endpoints."""
     headers = ["Subscription", "Name", "Connected Service Type", "Private Link Resource ID", "Subnet"]
     rows = []
+    service_type_counts = {}  # Track counts of each service type
+    
     for sub_id, data in all_data.items():
         if "error" in data or "networking" not in data: continue
         sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
@@ -354,15 +418,46 @@ def _get_private_endpoints_table(all_data):
                     elif pls_id:
                         parts = pls_id.split('/')
                         if len(parts) > 7: service_type = parts[-3].capitalize()
-                rows.append([sub_name, pe.get("name", "Unknown"), service_type, pls_id_str, os.path.basename(pe.get("subnet_id", "Unknown"))])
+                
+                # Track service type counts
+                service_type_counts[service_type] = service_type_counts.get(service_type, 0) + 1
+                
+                rows.append([
+                    sub_name,
+                    pe.get("name", "Unknown"),
+                    service_type,
+                    pls_id_str,
+                    os.path.basename(pe.get("subnet_id", "Unknown"))
+                ])
              else: logging.warning(f"Skipping non-dictionary private endpoint in sub {sub_id}: {pe}")
-    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
+    
+    if not rows:
+        return "_No Private Endpoints found. This is expected if you're not using Azure Private Link or if your services are accessible through other networking configurations._"
+    
+    table = _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
+    
+    # Add summary section
+    summary = ["\n\n**Private Endpoints Summary:**"]
+    summary.append(f"- Total Private Endpoints: {len(rows)}")
+    if service_type_counts:
+        summary.append("- Service Types:")
+        for service_type, count in sorted(service_type_counts.items()):
+            summary.append(f"  - {service_type}: {count} endpoint(s)")
+    
+    return table + "\n".join(summary)
 
 def _get_internet_ingress_list(all_data):
     """Generates Markdown list for potential Internet Ingress points."""
     ingress_points = []
     for sub_id, data in all_data.items():
+        # Ensure data is a dictionary before processing
+        if not isinstance(data, dict):
+            logging.warning(f"Skipping entry in _get_internet_ingress_list as data is not a dict. Key: {sub_id}, Type: {type(data)}")
+            continue
+            
+        # Original check for error key
         if "error" in data: continue
+        
         sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
         public_ips = data.get("networking", {}).get("public_ips", [])
         for ip in public_ips:
@@ -382,13 +477,86 @@ def _get_internet_ingress_list(all_data):
                  ingress_points.append(f"- Front Door (Std/Premium): **{afd.get('name', 'Unknown')}** (Sub: {sub_name}, SKU: {sku_name})")
     return "\n".join(sorted(ingress_points)) if ingress_points else "_No common internet ingress points (Public IPs on key services, App Gateways, Front Doors) detected._"
 
+def _get_waf_summary(subscription_data):
+    """Generates a summary of Web Application Firewall usage."""
+    waf_on_agw_count = 0
+    waf_on_afd_count = 0 # Placeholder for Front Door WAF check if fetcher works
+    standalone_waf_policies_count = 0
+    waf_details = [] # To store details like policy names or AGW names
+
+    for sub_id, data in subscription_data.items():
+        if "error" in data or "networking" not in data:
+            continue
+            
+        networking = data["networking"]
+        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
+
+        # Check Application Gateways for WAF
+        app_gateways = networking.get("application_gateways", [])
+        for agw in app_gateways:
+            if isinstance(agw, dict):
+                waf_config = agw.get("waf_configuration")
+                if waf_config and waf_config.get("enabled"):
+                    waf_on_agw_count += 1
+                    mode = waf_config.get("firewall_mode", "Unknown")
+                    waf_details.append(f"- App Gateway **{agw.get('name')}** (Sub: {sub_name}, Mode: {mode})")
+                elif agw.get("firewall_policy_id"):
+                    waf_on_agw_count += 1 # Counts AGW linked to a WAF Policy
+                    policy_name = agw["firewall_policy_id"].split('/')[-1]
+                    waf_details.append(f"- App Gateway **{agw.get('name')}** (Sub: {sub_name}, Policy: {policy_name})")
+
+        # Check Front Doors for WAF (Needs specific key from fetcher)
+        # Placeholder: Assuming fetcher returns a list under 'front_doors_std_premium'
+        # and each item has a 'waf_policy_id' or similar.
+        front_doors = networking.get("front_doors_std_premium", []) # Adjust key if needed
+        for afd in front_doors:
+            if isinstance(afd, dict) and afd.get("waf_policy_id"): # Check the actual key used by fetcher
+                 waf_on_afd_count += 1
+                 policy_name = afd["waf_policy_id"].split('/')[-1]
+                 waf_details.append(f"- Front Door **{afd.get('name')}** (Sub: {sub_name}, Policy: {policy_name})")
+
+        # Count standalone WAF Policies
+        waf_policies = networking.get("waf_policies", [])
+        standalone_waf_policies_count += len(waf_policies)
+        for policy in waf_policies:
+             # Avoid double-counting details if already listed via AGW/AFD link
+             policy_name_short = policy.get('name')
+             if policy_name_short and not any(policy_name_short in detail for detail in waf_details):
+                  waf_details.append(f"- Standalone WAF Policy **{policy_name_short}** (Sub: {sub_name})")
+
+    total_waf_instances = waf_on_agw_count + waf_on_afd_count
+
+    if total_waf_instances == 0 and standalone_waf_policies_count == 0:
+        return "_No Web Application Firewall usage detected on Application Gateways or Front Doors. No standalone WAF Policies found._"
+    
+    summary = []
+    if total_waf_instances > 0:
+        summary.append(f"WAF detected on **{total_waf_instances}** instance(s) ({waf_on_agw_count} App Gateway(s), {waf_on_afd_count} Front Door(s)).")
+    if standalone_waf_policies_count > 0:
+        summary.append(f"Found **{standalone_waf_policies_count}** standalone WAF Policy resource(s)." + (" Ensure they are linked to AGW/AFD/CDN." if total_waf_instances == 0 else ""))
+        
+    if waf_details:
+        summary.append("\n**Details (Examples):**")
+        summary.extend(waf_details[:5]) # Show first 5 examples
+        if len(waf_details) > 5:
+             summary.append(f"- ... and {len(waf_details) - 5} more")
+
+    return "\n".join(summary)
+
 # --- Security, Governance, Compliance Section Helpers ---
 
 def _get_defender_status(all_data):
     """Generates Markdown list for Defender for Cloud status per subscription."""
     status_lines = []
     for sub_id, data in all_data.items():
+        # Ensure data is a dictionary before processing
+        if not isinstance(data, dict):
+            logging.warning(f"Skipping entry in _get_defender_status as data is not a dict. Key: {sub_id}, Type: {type(data)}")
+            continue 
+            
+        # Original check for error key within the dict
         if "error" in data: continue
+        
         sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
         security_data = data.get("security", {})
         defender_plans = security_data.get("defender_plans", [])
@@ -493,14 +661,12 @@ def _get_tagging_analysis(all_data):
 
 def _get_log_analytics_workspaces_table(all_data):
     """Generates Markdown table for Log Analytics Workspaces."""
-    headers = ["Subscription", "Name", "Region", "SKU", "Retention (Days)"]
+    headers = ["Subscription", "Name", "Region", "SKU", "Retention (Days)", "Solutions", "Linked Services"]
     rows = []
     for sub_id, data in all_data.items():
         if "error" in data: continue
         sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        # Assume workspaces are fetched under 'monitoring' or 'resources'
         workspaces = data.get("monitoring", {}).get("log_analytics_workspaces", [])
-        # Fallback check in resources if not in monitoring
         if not workspaces:
              resources = data.get("resources", [])
              workspaces = [r for r in resources if isinstance(r, dict) and r.get("type","").lower() == "microsoft.operationalinsights/workspaces"]
@@ -515,15 +681,44 @@ def _get_log_analytics_workspaces_table(all_data):
                 if sku == "Unknown": sku = properties.get("sku", {}).get("name", "Unknown")
                 if retention == "Unknown": retention = properties.get("retentionInDays", "Unknown")
                 
+                # Get solutions and linked services
+                solutions = properties.get("solutions", [])
+                linked_services = properties.get("linked_services", [])
+                
+                # Format solutions and linked services for display
+                solutions_str = ", ".join(sorted(set(s.get("product", s.get("name", "Unknown")) for s in solutions if isinstance(s, dict)))) or "None"
+                linked_services_str = ", ".join(sorted(set(s.get("type", "Unknown").split("/")[-1] for s in linked_services if isinstance(s, dict)))) or "None"
+                
                 rows.append([
                     sub_name,
                     ws.get("name", "Unknown"),
                     ws.get("location", "Unknown"),
                     sku,
-                    str(retention) # Ensure it's a string
+                    str(retention),
+                    solutions_str,
+                    linked_services_str
                 ])
             else: logging.warning(f"Skipping non-dictionary LA Workspace in sub {sub_id}: {ws}")
-    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
+    
+    table = _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
+    
+    # Add a summary section after the table
+    summary = []
+    total_workspaces = len(rows)
+    if total_workspaces > 0:
+        # Count workspaces with solutions
+        workspaces_with_solutions = sum(1 for row in rows if row[5] != "None")
+        # Count workspaces with linked services
+        workspaces_with_links = sum(1 for row in rows if row[6] != "None")
+        
+        summary.append(f"\n\n**Summary:**")
+        summary.append(f"- Total Workspaces: {total_workspaces}")
+        if workspaces_with_solutions > 0:
+            summary.append(f"- Workspaces with Solutions: {workspaces_with_solutions} ({(workspaces_with_solutions/total_workspaces)*100:.1f}%)")
+        if workspaces_with_links > 0:
+            summary.append(f"- Workspaces with Linked Services: {workspaces_with_links} ({(workspaces_with_links/total_workspaces)*100:.1f}%)")
+    
+    return table + "\n".join(summary) if summary else table
 
 def _get_agent_status_summary(all_data):
     """Provides a high-level summary of monitoring agent status (heuristic)."""
@@ -799,189 +994,75 @@ def _get_landing_zone_examples(all_data, max_examples=3, max_resources_per_lz=5)
 # --- Placeholder Content Helpers ---
 
 def _analyze_network_topology(all_data):
-    """Enhanced heuristic to describe topology based on cross-subscription peering patterns."""
-    has_peering = False
-    has_firewall = False
-    vnet_count = 0
-    all_vnets = {}  # Map vnet_id -> {subscription, name, peer_count_outgoing, peer_count_incoming}
-    vnets_with_firewall = set()  # Set of VNet IDs that contain a firewall
+    """
+    Analyzes the network topology across all subscriptions.
+    Returns a string containing the analysis in markdown format.
+    """
+    sections = []
     
-    # First pass: Collect all VNets and basic info
-    for sub_id, data in all_data.items():
-        if "error" in data or "networking" not in data: continue
-        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        
-        # Track VNets
-        vnets = data["networking"].get("vnets", [])
-        vnet_count += len(vnets)
-        for vnet in vnets:
-            if not isinstance(vnet, dict): continue
-            vnet_id = vnet.get("id")
-            if vnet_id:
-                all_vnets[vnet_id] = {
-                    "subscription_id": sub_id,
-                    "subscription_name": sub_name,
-                    "name": vnet.get("name", "Unknown"),
-                    "peer_count_outgoing": 0,
-                    "peer_count_incoming": 0,
-                    "allows_gateway_transit": False,
-                    "uses_remote_gateways": False,
-                    "is_hub_candidate": False
-                }
-        
-        # Check for firewalls and associate with their VNets
-        firewalls = data["networking"].get("firewalls", [])
-        if firewalls:
-            has_firewall = True
-            for fw in firewalls:
-                if isinstance(fw, dict):
-                    # Get the VNet where this firewall is located
-                    fw_subnet_id = fw.get("subnet_id")
-                    if fw_subnet_id:
-                        # Extract VNet ID from subnet ID
-                        # Format: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/virtualNetworks/{vnet}/subnets/{subnet}
-                        parts = fw_subnet_id.split("/subnets/")
-                        if len(parts) > 1:
-                            fw_vnet_id = parts[0]
-                            vnets_with_firewall.add(fw_vnet_id)
-    
-    # Second pass: Analyze peerings to determine hub-spoke relationships
-    for sub_id, data in all_data.items():
-        if "error" in data or "networking" not in data: continue
-        
-        # Track peerings
-        peerings = data["networking"].get("peerings", [])
-        if peerings:
-            has_peering = True
-            for peering in peerings:
-                if not isinstance(peering, dict): continue
-                
-                local_vnet_id = peering.get("local_vnet_id")
-                remote_vnet_id = peering.get("remote_vnet_id")
-                
-                if local_vnet_id and remote_vnet_id:
-                    # Increment outgoing peer count for local VNet
-                    if local_vnet_id in all_vnets:
-                        all_vnets[local_vnet_id]["peer_count_outgoing"] += 1
-                        
-                        # Check for gateway transit flags
-                        if peering.get("allow_gateway_transit"):
-                            all_vnets[local_vnet_id]["allows_gateway_transit"] = True
-                            # A VNet that allows gateway transit is a strong hub indicator
-                            all_vnets[local_vnet_id]["is_hub_candidate"] = True
-                        
-                        if peering.get("use_remote_gateways"):
-                            all_vnets[local_vnet_id]["uses_remote_gateways"] = True
-                    
-                    # Increment incoming peer count for remote VNet
-                    if remote_vnet_id in all_vnets:
-                        all_vnets[remote_vnet_id]["peer_count_incoming"] += 1
-                    
-                    # If remote VNet not in our list, treat it as external
-                    elif "..." not in remote_vnet_id:  # Skip placeholders
-                        # Create stub entry for external VNet
-                        subscription_id = None
-                        try:
-                            # Try to extract subscription ID from remote VNet ID
-                            if "/subscriptions/" in remote_vnet_id:
-                                parts = remote_vnet_id.split("/")
-                                if len(parts) > 3:
-                                    subscription_id = parts[2]
-                        except:
-                            pass
-                        
-                        all_vnets[remote_vnet_id] = {
-                            "subscription_id": subscription_id,
-                            "subscription_name": "External",
-                            "name": remote_vnet_id.split('/')[-1] if '/' in remote_vnet_id else "Unknown",
-                            "peer_count_outgoing": 0,
-                            "peer_count_incoming": 1,  # We know at least this peering points to it
-                            "allows_gateway_transit": False,
-                            "uses_remote_gateways": False,
-                            "is_hub_candidate": False,
-                            "is_external": True
-                        }
-    
-    # Third pass: Identify the hub(s) based on multiple criteria
-    hub_vnets = []
-    vnet_ids_with_firewalls = []
-    
-    # Mark VNets with firewalls as hub candidates and collect their IDs
-    for vnet_id, vnet_info in all_vnets.items():
-        if vnet_id in vnets_with_firewall:
-            vnet_info["is_hub_candidate"] = True
-            vnet_ids_with_firewalls.append(vnet_id)
-    
-    # Calculate a "hub score" for each VNet
-    for vnet_id, vnet_info in all_vnets.items():
-        # Skip external VNets from hub candidates
-        if vnet_info.get("is_external", False):
-            continue
-            
-        # Criteria for being a hub:
-        hub_score = 0
-        
-        # 1. Has a firewall (+5)
-        if vnet_id in vnets_with_firewall:
-            hub_score += 5
-            
-        # 2. Allows gateway transit (+3)
-        if vnet_info["allows_gateway_transit"]:
-            hub_score += 3
-            
-        # 3. Has many incoming peerings (+1 per incoming, max 3)
-        incoming_score = min(vnet_info["peer_count_incoming"], 3)
-        hub_score += incoming_score
-        
-        # 4. Has word "hub" in the name (+2)
-        if "hub" in vnet_info["name"].lower():
-            hub_score += 2
-            
-        # 5. Is in a subscription with "corp", "hub", "connectivity", or "networking" in the name (+1)
-        sub_name = vnet_info["subscription_name"].lower()
-        if any(kw in sub_name for kw in ["corp", "hub", "connectivity", "networking", "shared", "platform"]):
-            hub_score += 1
-            # Flag specifically as "Corporate Landing Zone" when "corp" is in the subscription name
-            if "corp" in sub_name:
-                vnet_info["is_corporate_landing_zone"] = True
-        else:
-            vnet_info["is_corporate_landing_zone"] = False
-            
-        # Save the hub score
-        vnet_info["hub_score"] = hub_score
-        
-        # Add to hub list if score is high enough
-        if hub_score >= 3:  # Threshold for being considered a hub
-            hub_vnets.append((vnet_id, vnet_info, hub_score))
-    
-    # Sort hubs by score
-    hub_vnets.sort(key=lambda x: x[2], reverse=True)
-    
-    # Determine result based on analysis
-    if not has_peering:
-        return "Multiple VNets exist but **no VNet Peering** detected between them."
-    
-    if hub_vnets:
-        # We found hub(s)
-        primary_hub = hub_vnets[0][1]  # Get the highest scoring hub's info
-        sub_name = primary_hub["subscription_name"]
-        vnet_name = primary_hub["name"]
-        
-        # Check if this is a Corporate Landing Zone hub
-        is_corporate_hub = primary_hub.get("is_corporate_landing_zone", False)
-        hub_description = "Corporate Landing Zone hub" if is_corporate_hub else "Hub VNet"
-        
-        # Check if we have multiple hubs or just one
-        if len(hub_vnets) > 1:
-            hub_names = [h[1]["name"] for h in hub_vnets[:2]]  # Top 2 hubs
-            return f"Likely **Hub-Spoke** topology with multiple hubs. Primary Hub: **{vnet_name}** in '{sub_name}' ({hub_description}). Secondary hub: {hub_names[1]}."
-        else:
-            return f"Likely **Hub-Spoke** topology detected. {hub_description}: **{vnet_name}** in subscription '{sub_name}'."
-    
-    if has_firewall:
-        return "Network connectivity with Azure Firewall detected, but clear Hub-Spoke topology not identified."
-    else:
-        return "**Connected VNets (Mesh/Partial Mesh)** detected via peering but no clear hub identified."
+    try:
+        # Add overview section
+        sections.append("""
+### Network Topology Overview
+This section provides an analysis of the network architecture across all subscriptions, including VNets, peering, connectivity, and security components.
+""")
+
+        # Add VNets table
+        sections.append("### Virtual Networks\n")
+        vnets_table = _get_vnets_table(all_data)
+        sections.append(vnets_table if vnets_table else "_No Virtual Networks found._\n")
+
+        # Add Peering information
+        sections.append("\n### VNet Peering\n")
+        peering_table = _get_peering_table(all_data)
+        sections.append(peering_table if peering_table else "_No VNet peering configurations found._\n")
+
+        # Add Gateway information
+        sections.append("\n### Network Gateways\n")
+        gateways_table = _get_gateways_table(all_data)
+        sections.append(gateways_table if gateways_table else "_No network gateways found._\n")
+
+        # Add Firewall information
+        sections.append("\n### Azure Firewalls\n")
+        firewalls_table = _get_firewalls_table(all_data)
+        sections.append(firewalls_table if firewalls_table else "_No Azure Firewalls found._\n")
+
+        # Add DNS information
+        sections.append("\n### DNS Configuration\n")
+        dns_details = _get_dns_details(all_data)
+        sections.append(dns_details if dns_details else "_No DNS configurations found._\n")
+
+        # Add Private Endpoints
+        sections.append("\n### Private Endpoints\n")
+        private_endpoints = _get_private_endpoints_table(all_data)
+        sections.append(private_endpoints if private_endpoints else "_No private endpoints found._\n")
+
+        # Add Internet Ingress Points
+        sections.append("\n### Internet Ingress Points\n")
+        ingress_list = _get_internet_ingress_list(all_data)
+        sections.append(ingress_list if ingress_list else "_No internet ingress points identified._\n")
+
+        # Add Internet Egress Analysis
+        sections.append("\n### Internet Egress Analysis\n")
+        egress_analysis = _analyze_internet_egress(all_data)
+        sections.append(egress_analysis if egress_analysis else "_No internet egress analysis available._\n")
+
+        # Add Service Endpoints Summary
+        sections.append("\n### Service Endpoints\n")
+        endpoints_summary = _get_service_endpoints_summary(all_data)
+        sections.append(endpoints_summary if endpoints_summary else "_No service endpoints configured._\n")
+
+        # Add Private Link Services
+        sections.append("\n### Private Link Services\n")
+        private_links = _get_private_link_services_table(all_data)
+        sections.append(private_links if private_links else "_No private link services found._\n")
+
+        # Convert all sections to strings and join
+        return "\n".join([str(section) for section in sections if section is not None])
+
+    except Exception as e:
+        logging.error(f"Error in network topology analysis: {str(e)}")
+        return "_Error analyzing network topology._"
 
 def _analyze_internet_egress(all_data):
     """Basic heuristic for Internet Egress path."""
@@ -1054,98 +1135,106 @@ def _get_subscription_diagram_links(all_data, diagram_paths, report_path_dir):
     return "\n".join(sorted(links)) if links else "_No subscription-specific diagrams found or paths provided._"
 
 def _get_app_services_table(all_data):
-    """Generates a detailed Markdown table for App Services."""
-    headers = ["Subscription", "App Name", "App Service Plan", "Runtime", "Location", "Endpoint Integration"]
+    """Generates Markdown table for App Services."""
+    headers = ["Subscription", "App Name", "Resource Group", "App Service Plan", "Runtime", "State", "URLs", "Security & Integration"]
     rows = []
-    found_any = False
-    
     for sub_id, data in all_data.items():
-        if "error" in data:
+        if "error" in data or "web_details" not in data:
             continue
-            
         sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        resources = data.get("resources", [])
         
-        # Find all app service plans first for later reference
-        app_plans = {}
-        for res in resources:
-            if isinstance(res, dict) and res.get("type") == "Microsoft.Web/serverfarms":
-                app_plans[res.get("id", "").lower()] = {
-                    "name": res.get("name", "Unknown"),
-                    "sku": res.get("sku", {}).get("name", "Unknown")
+        # Create a map of App Service Plans first
+        asp_map = {}
+        for plan in data["web_details"].get("app_service_plans", {}).values():
+            if isinstance(plan, dict):
+                plan_name = plan.get("name", "Unknown")
+                sku = plan.get("sku", {})
+                asp_map[plan_name] = {
+                    "tier": sku.get("tier", "Unknown"),
+                    "size": sku.get("size", "Unknown"),
+                    "capacity": sku.get("capacity", 1)
                 }
         
-        # Process all app services
-        for res in resources:
-            if isinstance(res, dict) and res.get("type") == "Microsoft.Web/sites":
-                found_any = True
-                app_name = res.get("name", "Unknown")
-                location = res.get("location", "Unknown")
-                properties = res.get("properties", {})
-                kind = res.get("kind", "app") # Default to 'app' if not specified
+        for app in data["web_details"].get("app_services", []):
+            if not isinstance(app, dict):
+                continue
                 
-                # Skip function apps etc. if we only want web apps (can refine later)
-                # if "functionapp" in kind.lower(): continue
+            name = app.get("name", "Unknown")
+            location = app.get("location", "Unknown")
+            resource_group = app.get("resource_group", "Unknown")
+            state = app.get("state", "Unknown")
+            
+            # Get App Service Plan details
+            plan_name = os.path.basename(app.get("server_farm_id", "Unknown"))
+            plan_details = asp_map.get(plan_name, {})
+            plan_display = f"{plan_name} ({plan_details.get('tier', '')} {plan_details.get('size', '')})"
+            
+            # Get runtime details
+            site_config = app.get("site_config", {})  # Changed back to site_config since that's what the fetcher returns
+            runtime = "Unknown"
+            if site_config:
+                if site_config.get("linux_fx_version"):
+                    runtime = site_config["linux_fx_version"]
+                elif site_config.get("windows_fx_version"):
+                    runtime = site_config["windows_fx_version"]
+                elif site_config.get("java_version"):
+                    runtime = f"Java {site_config['java_version']}"
+                    if site_config.get("java_container"):
+                        runtime += f" ({site_config['java_container']} {site_config.get('java_container_version', '')})"
+                elif site_config.get("php_version"):
+                    runtime = f"PHP {site_config['php_version']}"
+                elif site_config.get("python_version"):
+                    runtime = f"Python {site_config['python_version']}"
+                elif site_config.get("node_version"):
+                    runtime = f"Node {site_config['node_version']}"
+                elif site_config.get("net_framework_version"):
+                    runtime = f".NET {site_config['net_framework_version']}"
+                elif site_config.get("current_stack"):
+                    runtime = f"Stack: {site_config['current_stack']}"
                 
-                # Get runtime stack info (Improved detection)
-                runtime = "Unknown"
-                site_config = properties.get("siteConfig", {})
-                if site_config:
-                    if site_config.get("linuxFxVersion"): runtime = site_config.get("linuxFxVersion")
-                    elif site_config.get("windowsFxVersion"): runtime = site_config.get("windowsFxVersion")
-                    elif site_config.get("javaVersion"): runtime = f'Java {site_config.get("javaVersion")}'
-                    elif site_config.get("phpVersion"): runtime = f'PHP {site_config.get("phpVersion")}'
-                    elif site_config.get("pythonVersion"): runtime = f'Python {site_config.get("pythonVersion")}'
-                    elif site_config.get("nodeVersion"): runtime = f'Node {site_config.get("nodeVersion")}'
-                    elif site_config.get("netFrameworkVersion"): runtime = f'.NET Framework {site_config.get("netFrameworkVersion")}'
-                    # Fallback checks if specific versions aren't set
-                    elif "DOCKER" in str(site_config.get("linuxFxVersion", "")).upper(): runtime = "Container (Linux)"
-                    elif "COMPOSE" in str(site_config.get("linuxFxVersion", "")).upper(): runtime = "Docker Compose"
-                    elif "dotnet" in str(site_config.get("windowsFxVersion", "")).lower(): runtime = ".NET Core (Windows)"
-                    elif site_config.get("metadata"): # Check metadata for clues
-                        metadata = site_config.get("metadata", [])
-                        current_stack = next((m.get("value") for m in metadata if m.get("name") == "CURRENT_STACK"), None)
-                        if current_stack: runtime = f"Stack: {current_stack}"
-
-                # Get App Service Plan info (Safer access)
-                plan_id = properties.get("serverFarmId", "").lower()
-                plan_info = "Unknown"
-                if plan_id in app_plans:
-                    plan = app_plans[plan_id]
-                    plan_info = f"{plan.get('name', 'Unknown')} ({plan.get('sku', 'Unknown')})"
-                elif plan_id: # Extract name if plan object wasn't found
-                    plan_info = plan_id.split('/')[-1]
-                
-                # Check for key integrations
-                integrations = []
-                # VNet integration
-                if "WEBSITE_VNET_ROUTE_ALL" in str(site_config):
-                    integrations.append("VNet")
-                # Private Endpoints
-                private_endpoints = data.get("networking", {}).get("private_endpoints", [])
-                has_private_endpoint = False
-                for pe in private_endpoints:
-                    if isinstance(pe, dict):
-                        conn = pe.get("private_link_service_connections", [])
-                        if conn and isinstance(conn[0], dict):
-                            target_id = conn[0].get("private_link_service_id", "").lower()
-                            if target_id == res.get("id", "").lower():
-                                has_private_endpoint = True
-                                break
-                if has_private_endpoint:
-                    integrations.append("Private Endpoint")
-                
-                # Check for App Insights
-                if site_config and any(k.startswith("APPINSIGHTS_") for k in site_config.keys()):
-                    integrations.append("App Insights")
-                
-                integration_str = ", ".join(integrations) if integrations else "None detected"
-                rows.append([sub_name, app_name, plan_info, runtime, location, integration_str])
+                # Check if it's a container
+                if runtime.startswith("DOCKER|"):
+                    runtime = f"Container: {runtime.split('|')[1]}"
+                elif runtime.startswith("COMPOSE|"):
+                    runtime = "Docker Compose"
+                    
+                # Check if it's a function app
+                if app.get("kind", "").lower().startswith("functionapp"):
+                    runtime = f"Function App ({runtime})"
+            
+            # Get URLs
+            host_names = app.get("host_names", [])
+            urls = ", ".join([f"`{host}`" for host in host_names]) if host_names else "No URLs"
+            
+            # Get security and integration details
+            security_features = []
+            if app.get("https_only"):
+                security_features.append("HTTPS Only")
+            if app.get("virtual_network_subnet_id"):
+                security_features.append("VNet Integration")
+            if app.get("identity", {}).get("type"):
+                security_features.append(f"MSI ({app['identity']['type']})")
+            if any(setting.get("name") == "APPINSIGHTS_INSTRUMENTATIONKEY" 
+                  for setting in app.get("app_settings", [])):
+                security_features.append("App Insights")
+            
+            security_text = ", ".join(security_features) if security_features else "Basic"
+            
+            rows.append([
+                sub_name,
+                name,
+                resource_group,
+                plan_display,
+                runtime,
+                state,
+                urls,
+                security_text
+            ])
     
-    if not found_any:
-        return "_No App Services detected in the environment._"
-        
-    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
+    if not rows:
+        return "_No App Services found in audited subscriptions._"
+    
+    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[2], x[1])))  # Sort by subscription, resource group, name
 
 def _get_vms_table(all_data):
     """Generates Markdown table for Virtual Machines."""
@@ -1166,42 +1255,48 @@ def _get_vms_table(all_data):
                 found_any = True
                 vm_name = res.get("name", "Unknown")
                 properties = res.get("properties", {})
-                
-                # Get Size
-                vm_size = properties.get("hardwareProfile", {}).get("vmSize", "Unknown")
-                if vm_size == "Unknown":
-                    vm_size = res.get("size", "Unknown") # Alternate location sometimes used
-
-                # Get OS Type (more robustly)
-                os_type = "Unknown"
-                os_profile = properties.get("osProfile", {})
-                if os_profile:
-                    if os_profile.get("windowsConfiguration"):
-                        os_type = "Windows"
-                    elif os_profile.get("linuxConfiguration"):
-                        os_type = "Linux"
-                
-                # Try alternate method if not found
-                if os_type == "Unknown":
-                    storage_profile = properties.get("storageProfile", {})
-                    os_disk = storage_profile.get("osDisk", {})
-                    os_type_from_disk = os_disk.get("osType") # Returns 'Windows' or 'Linux'
-                    if os_type_from_disk:
-                        os_type = os_type_from_disk
-
                 location = res.get("location", "Unknown")
-                # Get Status (prefer instance view)
-                status = "Unknown"
-                instance_view = properties.get("instanceView", {})
-                if instance_view:
-                    statuses = instance_view.get("statuses", [])
-                    # Look for PowerState status like 'PowerState/running' or 'PowerState/deallocated'
-                    power_status = next((s.get("displayStatus") for s in statuses if s.get("code", "").startswith("PowerState/")), None)
-                    if power_status:
-                        status = power_status
-                # Fallback to provisioning state if instance view not available/useful
+
+                # --- Get Size ---
+                # Prioritize the merged top-level key first
+                vm_size = res.get("vmSize", "Unknown")
+                # Fallback to nested properties if top-level key isn't present
+                if vm_size == "Unknown":
+                    vm_size = properties.get("hardwareProfile", {}).get("vmSize", "Unknown")
+
+                # --- Get OS Type ---
+                # Prioritize the merged top-level key first
+                os_type = res.get("osType", "Unknown")
+                # Fallback to nested properties if top-level key isn't present
+                if os_type == "Unknown":
+                    os_profile = properties.get("osProfile", {})
+                    if os_profile:
+                        if os_profile.get("windowsConfiguration"):
+                            os_type = "Windows"
+                        elif os_profile.get("linuxConfiguration"):
+                            os_type = "Linux"
+                    # Try alternate disk method if still unknown
+                    if os_type == "Unknown": # Corrected indentation
+                        storage_profile = properties.get("storageProfile", {})
+                        os_disk = storage_profile.get("osDisk", {})
+                        os_type_from_disk = os_disk.get("osType") # Corrected indentation
+                        if os_type_from_disk:
+                            os_type = os_type_from_disk
+
+                # --- Get Status ---
+                # Prioritize the merged top-level key first
+                status = res.get("status", "Unknown")
+                # Fallback to nested properties (instanceView) if top-level key isn't present
                 if status == "Unknown":
-                     status = properties.get("provisioningState", "Unknown")
+                    instance_view = properties.get("instanceView", {})
+                    if instance_view:
+                        statuses = instance_view.get("statuses", [])
+                        power_status = next((s.get("displayStatus") for s in statuses if s.get("code", "").startswith("PowerState/")), None)
+                        if power_status:
+                            status = power_status
+                        # Fallback to provisioning state if still unknown
+                    if status == "Unknown":
+                        status = properties.get("provisioningState", "Unknown")
 
                 rows.append([sub_name, vm_name, vm_size, os_type, location, status])
     
@@ -1210,1945 +1305,1970 @@ def _get_vms_table(all_data):
     
     return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
 
-# --- Main Function ---
+# --- Data Aggregation & Analysis Helpers ---
+# (These functions process the raw data into summaries/tables for the placeholders)
 
-def generate_design_document(all_data, base_output_dir, tenant_display_name, tenant_default_domain, document_version, diagram_paths={}, timestamp_str="", silent_mode=False):
-    """Generates a timestamped Azure Landing Zone Design Document using a template.
+# Example: (Keep existing helper functions like _get_storage_accounts_table etc.)
+
+# ... existing code ...
+
+def _get_management_group_hierarchy_summary(mg_list):
+    """Analyzes Management Group hierarchy for the design document.
 
     Args:
-        all_data (dict): The aggregated data from all fetchers.
-        base_output_dir (str): The base directory for outputs.
-        tenant_display_name (str): The fetched display name of the tenant (e.g., "Contoso Corp").
-        tenant_default_domain (str): The fetched default domain of the tenant (e.g., "contoso.onmicrosoft.com").
-        document_version (float): The version number for this document run (e.g., 1.0, 2.0).
-        diagram_paths (dict): A dictionary mapping subscription IDs/tenant to their generated diagram paths.
-        timestamp_str (str): Timestamp string for filenames.
-        silent_mode (bool): Whether to suppress console output.
-    """
-    os.makedirs(REPORT_DIR, exist_ok=True)
-    # Define the report path directory based on base_output_dir
-    report_path_dir = os.path.join(base_output_dir, REPORT_DIR)
-    os.makedirs(report_path_dir, exist_ok=True) # Ensure it exists
-
-    # --- File Naming ---
-    filename_base = f"Azure_Design_Document_{tenant_display_name.replace(' ', '_')}"
-    filename = f"{filename_base}_{timestamp_str}_v{document_version:.1f}.md"
-    report_path = os.path.join(REPORT_DIR, filename)
-
-    if not silent_mode:
-        print(f"Generating Design Document: {report_path}")
-    logging.info(f"Generating Design Document: {report_path}")
-
-    # --- Document Content Initialization ---
-    content = [
-        f"# Azure Enterprise Architecture & Design - {tenant_display_name}",
-        f"**Document Version:** {document_version:.1f} (Generated)",
-        f"**Date Generated (Local):** {datetime.strptime(timestamp_str, '%Y%m%d_%H%M%S').strftime('%Y-%m-%d %H:%M:%S')} ({time.tzname[time.daylight]})\n"
-    ]
-
-    # --- Table of Contents (Placeholder - can be generated later) ---
-    content.append("## Table of Contents")
-    content.append("*(Auto-generated TOC can be added here)*\n")
-
-    # --- 1. Executive Summary ---
-    # ... (rest of content generation - Needs update to use document_version) ...
-
-    # --- Use passed-in Tenant Info ---
-    # Use the display name directly for titles/overviews
-    report_tenant_name = tenant_display_name if tenant_display_name and "(Tenant ID)" not in tenant_display_name else "Azure Environment"
-    
-    # Use the default domain specifically for the identity section
-    identity_tenant_domain = tenant_default_domain if tenant_default_domain and "(Tenant ID)" not in tenant_default_domain else "Entra ID Tenant"
-    
-    # Extract compliance standards from policy assignments
-    compliance_standards = []
-    for sub_id, data in all_data.items():
-        if "error" in data or "governance" not in data:
-            continue
+        mg_list (list): The list of management groups with parent_id relationships.
         
-        policies = data["governance"].get("policy_assignments", [])
-        for policy in policies:
-            if isinstance(policy, dict):
-                policy_name = policy.get("name", "").lower()
-                # Look for common compliance policy names
-                if any(std in policy_name for std in ["iso", "hipaa", "pci", "gdpr", "nist", "fedramp", "soc"]):
-                    for std in ["iso27001", "iso 27001", "hipaa", "pci", "gdpr", "nist", "fedramp", "soc"]:
-                        if std in policy_name and std.upper() not in compliance_standards:
-                            compliance_standards.append(std.upper())
+    Returns:
+        str: Markdown-formatted summary of the MG hierarchy.
+    """
+    if not mg_list:
+        return "_No Management Groups found in tenant._"
     
-    compliance_text = ", ".join(compliance_standards) if compliance_standards else "No specific compliance standards detected from policy assignments"
+    # Start with simple list approach
+    mg_summary = []
+    for mg in mg_list:
+        if isinstance(mg, dict):
+            name = mg.get('name') or mg.get('display_name', 'Unknown')
+            mg_id = mg.get('id', 'Unknown ID')
+            parent = mg.get('parent_name', 'Root')
+            if parent != 'Root':
+                mg_summary.append(f"- **{name}** (`{mg_id}`) ← *Child of {parent}*")
+            else:
+                mg_summary.append(f"- **{name}** (`{mg_id}`) ← *Root Level*")
+    
+    if not mg_summary:
+        return "_Management Group data format not compatible with analysis._"
+    
+    return "\n".join(mg_summary)
 
-    # Calculate values needed for multiple placeholders first
-    primary_regions = _get_primary_regions(all_data)
-    connectivity_summary = _get_connectivity_summary(all_data)
-    network_topology_summary = _analyze_network_topology(all_data)
-    sentinel_status_str = _get_sentinel_status(all_data)
-    defender_status_list = _get_defender_status(all_data)
-    backup_redundancy_summary = _get_backup_redundancy_summary(all_data)
+def _analyze_rg_naming_patterns(all_data):
+    """Analyzes Resource Group naming patterns from all subscriptions.
     
-    # Check for AD Connect by looking for hybrid indicators
-    ad_connect_status = "Not Detected"
+    Args:
+        all_data (dict): Dictionary of subscription data from fetchers.
+        
+    Returns:
+        str: Markdown-formatted summary of detected patterns.
+    """
+    if not all_data:
+        return "_No subscription data available for resource group analysis._"
+    
+    # Collect all resource group names
+    all_rgs = []
+    for sub_id, data in all_data.items():
+        if "error" in data or "resource_groups" not in data:
+            continue
+        rgs = data.get("resource_groups", [])
+        for rg in rgs:
+            if isinstance(rg, dict) and "name" in rg:
+                all_rgs.append(rg["name"])
+    
+    if not all_rgs:
+        return "_No resource groups found in the environment._"
+    
+    # Analyze patterns - look for common prefixes
+    prefix_counts = {}
+    for rg_name in all_rgs:
+        parts = rg_name.split('-')
+        if len(parts) > 1:
+            prefix = parts[0].lower()
+            prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+    
+    # Find the top 3 most common prefixes
+    sorted_prefixes = sorted(prefix_counts.items(), key=lambda x: x[1], reverse=True)
+    
+    if not sorted_prefixes:
+        return "_No common patterns detected in resource group names._"
+    
+    # Create summary
+    prefix_summary = []
+    for prefix, count in sorted_prefixes[:3]:
+        percentage = (count / len(all_rgs)) * 100
+        prefix_summary.append(f"- Prefix `{prefix}-`: {count} groups ({percentage:.1f}% of total)")
+    
+    if prefix_summary:
+        pattern_text = "\n".join(prefix_summary)
+        return f"Common patterns detected in {len(all_rgs)} resource groups:\n{pattern_text}"
+    else:
+        return "_No clear naming patterns detected across resource groups._"
+
+def _analyze_resource_lifecycle(all_data):
+    """Analyzes resource lifecycle patterns from the collected data.
+    
+    Args:
+        all_data (dict): Dictionary of subscription data from fetchers.
+        
+    Returns:
+        str: Markdown-formatted summary of lifecycle patterns.
+    """
+    if not all_data:
+        return "_No subscription data available for resource lifecycle analysis._"
+    
+    # Check for lifecycle-related tags
+    lifecycle_tags = ["environment", "env", "stage", "lifecycle", "expiration", "ttl", "expires"]
+    tag_counts = {tag: 0 for tag in lifecycle_tags}
+    
+    # Track resources with expirations or lifecycle indicators
+    total_resources_with_tags = 0
+    total_resources = 0
+    
+    # Look for resources with lifecycle policies or retention settings
+    storage_with_lifecycle = 0
+    total_storage = 0
+    key_vaults_soft_delete = 0
+    total_key_vaults = 0
+    
     for sub_id, data in all_data.items():
         if "error" in data:
             continue
         
-        # Look for AD Connect instances in resource list
-        resources = data.get("resources", [])
-        for res in resources:
-            if isinstance(res, dict) and "ADConnect" in res.get("name", ""):
-                ad_connect_status = f"Likely Configured (Found resource: {res.get('name')})"
-                break
+        # Check for tagged resources
+        for resource_type in ["virtual_machines", "storage_accounts", "app_services", "key_vaults"]:
+            if resource_type in data:
+                resources = data.get(resource_type, [])
+                total_resources += len(resources)
                 
-        # Look for AD Connect health service in Log Analytics solutions
-        if ad_connect_status == "Not Detected":
-            log_analytics = data.get("monitoring", {}).get("log_analytics_workspaces", [])
-            for ws in log_analytics:
-                if isinstance(ws, dict):
-                    solutions = ws.get("solutions", [])
-                    if any(sol.get("name", "").lower().startswith("adconnect") for sol in solutions if isinstance(sol, dict)):
-                        ad_connect_status = "Detected (Log Analytics ADConnect Health Solution found)"
-                        break
+                for resource in resources:
+                    if not isinstance(resource, dict):
+                        continue
+                    
+                    # Count resources with lifecycle tags
+                    tags = resource.get("tags", {})
+                    if tags:
+                        for tag_name in tags:
+                            if tag_name.lower() in lifecycle_tags:
+                                tag_counts[tag_name.lower()] += 1
+                                total_resources_with_tags += 1
+                                break
+                    
+                    # Count storage accounts with lifecycle management
+                    if resource_type == "storage_accounts":
+                        total_storage += 1
+                        if resource.get("has_lifecycle_policy", False):
+                            storage_with_lifecycle += 1
+                    
+                    # Count Key Vaults with soft-delete enabled
+                    if resource_type == "key_vaults":
+                        total_key_vaults += 1
+                        if resource.get("soft_delete_enabled", False):
+                            key_vaults_soft_delete += 1
+    
+    if total_resources == 0:
+        return "_No resources found for lifecycle analysis._"
+    
+    # Create summary
+    lifecycle_summary = []
+    
+    # Add tag usage
+    if total_resources_with_tags > 0:
+        tag_percentage = (total_resources_with_tags / total_resources) * 100
+        lifecycle_summary.append(f"- **{tag_percentage:.1f}%** of resources have lifecycle-related tags")
         
-        # Check for hybrid networking like ExpressRoute or S2S VPN
-        if ad_connect_status == "Not Detected":
-            networking = data.get("networking", {})
-            gateways = networking.get("vpn_gateways", [])
-            circuits = networking.get("expressroute_circuits", [])
-            if gateways or circuits:
-                ad_connect_status = "Likely Configured (Hybrid connectivity detected - ExpressRoute/VPN)"
-                break
+        # Add most common tags
+        sorted_tags = sorted([(tag, count) for tag, count in tag_counts.items() if count > 0], 
+                           key=lambda x: x[1], reverse=True)
+        if sorted_tags:
+            top_tags = [f"`{tag}` ({count} resources)" for tag, count in sorted_tags[:3]]
+            lifecycle_summary.append(f"- Most common lifecycle tags: {', '.join(top_tags)}")
+    else:
+        lifecycle_summary.append("- No lifecycle-related tags detected on resources")
+    
+    # Add storage lifecycle stats
+    if total_storage > 0:
+        storage_percentage = (storage_with_lifecycle / total_storage) * 100
+        lifecycle_summary.append(f"- **{storage_percentage:.1f}%** of Storage Accounts have blob lifecycle management")
+    
+    # Add Key Vault soft-delete stats
+    if total_key_vaults > 0:
+        kv_percentage = (key_vaults_soft_delete / total_key_vaults) * 100
+        lifecycle_summary.append(f"- **{kv_percentage:.1f}%** of Key Vaults have soft-delete protection")
+    
+    if lifecycle_summary:
+        return "\n".join(lifecycle_summary)
+    else:
+        return "_No clear resource lifecycle patterns detected._"
+
+def _analyze_ad_connect_status(all_data):
+    """Analyzes the Azure AD Connect status based on detected hybrid identity components.
+    
+    Args:
+        all_data (dict): Dictionary of subscription data from fetchers.
+        
+    Returns:
+        str: Markdown-formatted summary of AD Connect status.
+    """
+    if not all_data:
+        return "_No subscription data available for AD Connect analysis._"
+    
+    # Look for components that indicate AD Connect:
+    # - Azure AD Connect Health service
+    # - AD FS servers
+    # - AD Domain Controllers
+    ad_connect_indicators = {
+        "ad_connect_health": False,
+        "adfs_servers": 0,
+        "domain_controllers": 0
+    }
+    
+    for sub_id, data in all_data.items():
+        if "error" in data:
+            continue
+        
+        # Check for AD Connect Health extension or service
+        if "virtual_machines" in data:
+            vms = data.get("virtual_machines", [])
+            for vm in vms:
+                if not isinstance(vm, dict):
+                    continue
                 
-    # Detect PIM status by looking for authorization model indicators
-    pim_status = "Not Detected"
+                vm_name = vm.get("name", "").lower()
+                vm_tags = vm.get("tags", {})
+                
+                # Check VM name or tags for indicators
+                if "adfs" in vm_name or "ad-fs" in vm_name:
+                    ad_connect_indicators["adfs_servers"] += 1
+                
+                if "dc" == vm_name[:2] or "domain" in vm_name:
+                    ad_connect_indicators["domain_controllers"] += 1
+                
+                # Check for tags indicating AD Connect or domain controllers
+                for tag_name, tag_value in vm_tags.items():
+                    tag_value = str(tag_value).lower() if tag_value else ""
+                    if "ad connect" in tag_value or "adconnect" in tag_value:
+                        ad_connect_indicators["ad_connect_health"] = True
+                    if "domain" in tag_value and "controller" in tag_value:
+                        ad_connect_indicators["domain_controllers"] += 1
+    
+    # Make a determination based on indicators
+    if ad_connect_indicators["ad_connect_health"]:
+        return "Azure AD Connect detected in environment"
+    elif ad_connect_indicators["adfs_servers"] > 0:
+        return f"Possible AD FS deployment detected ({ad_connect_indicators['adfs_servers']} potential servers)"
+    elif ad_connect_indicators["domain_controllers"] > 0:
+        return f"Possible hybrid identity with {ad_connect_indicators['domain_controllers']} potential domain controllers"
+    else:
+        return "No clear indicators of Azure AD Connect deployment (cloud-only identity likely)"
+
+def _analyze_rbac_approach(all_data):
+    """Analyzes RBAC patterns from the collected role assignments.
+    
+    Args:
+        all_data (dict): Dictionary of subscription data from fetchers.
+        
+    Returns:
+        str: Markdown-formatted summary of RBAC approach.
+    """
+    if not all_data:
+        return "_No subscription data available for RBAC analysis._"
+    
+    # Analyze role assignments
+    role_assignment_counts = {
+        "built_in": 0,
+        "custom": 0,
+        "user": 0,
+        "group": 0,
+        "service_principal": 0,
+        "managed_identity": 0,
+        "subscription": 0,
+        "resource_group": 0,
+        "resource": 0
+    }
+    
+    common_roles = {}
+    
     for sub_id, data in all_data.items():
         if "error" in data or "security" not in data:
             continue
         
-        # Look for Azure PIM role assignments (eligible assignments)
-        rbac = data["security"].get("role_assignments", [])
-        for role in rbac:
-            if isinstance(role, dict) and role.get("assignment_type") == "Eligible":
-                pim_status = "Enabled (Eligible role assignments detected)"
-                break
+        role_assignments = data["security"].get("role_assignments", [])
+        for assignment in role_assignments:
+            if not isinstance(assignment, dict):
+                continue
+            
+            # Count by role type
+            if assignment.get("role_definition_id", "").startswith("/providers/Microsoft.Authorization/roleDefinitions/"):
+                role_assignment_counts["built_in"] += 1
+            else:
+                role_assignment_counts["custom"] += 1
+            
+            # Count by principal type
+            principal_type = assignment.get("principal_type", "").lower()
+            if "user" in principal_type:
+                role_assignment_counts["user"] += 1
+            elif "group" in principal_type:
+                role_assignment_counts["group"] += 1
+            elif "service" in principal_type:
+                role_assignment_counts["service_principal"] += 1
+            elif "managed" in principal_type:
+                role_assignment_counts["managed_identity"] += 1
+            
+            # Count by scope level
+            scope = assignment.get("scope", "")
+            if scope:
+                if scope.count("/") <= 3:  # /subscriptions/{id}
+                    role_assignment_counts["subscription"] += 1
+                elif scope.count("/") <= 5:  # /subscriptions/{id}/resourceGroups/{name}
+                    role_assignment_counts["resource_group"] += 1
+                else:
+                    role_assignment_counts["resource"] += 1
+            
+            # Track common roles
+            role_name = assignment.get("role_definition_name", "Unknown")
+            if role_name != "Unknown":
+                common_roles[role_name] = common_roles.get(role_name, 0) + 1
     
-    # Detect managed identity usage
-    managed_identities = []
-    for sub_id, data in all_data.items():
-        if "error" in data:
-            continue
-        resources = data.get("resources", [])
-        for res in resources:
-            if isinstance(res, dict):
-                # Look for managed identity in resource tags or name
-                if res.get("type") == "Microsoft.ManagedIdentity/userAssignedIdentities":
-                    managed_identities.append(res.get("name", "Unknown"))
-                # Check if resources have managed identity enabled
-                elif res.get("identity", {}).get("type") in ["SystemAssigned", "UserAssigned", "SystemAssigned, UserAssigned"]:
-                    managed_identities.append(f"{res.get('name')} ({res.get('type')})")
+    total_assignments = sum(role_assignment_counts.values())
+    if total_assignments == 0:
+        return "_No role assignments found for analysis._"
     
-    managed_identity_status = f"In Use ({len(managed_identities)} instances detected)" if managed_identities else "Not Detected or Limited Usage"
-
-    # --- Define the Design Document Template ---    
-    # Use a standard timestamp format
-    now_utc = datetime.now(timezone.utc) # Use the directly imported timezone class
-    formatted_timestamp = now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')
+    # Create summary
+    rbac_summary = []
     
-    design_template = f"""
-# Azure Enterprise Architecture & Design Document: {report_tenant_name}
-
-**Document Version:** {document_version:.1f} (Generated) | **Date:** {formatted_timestamp} | **Status:** Auto-Generated from Environment Scan
-
-## 1. Executive Summary
-
-### 1.1. Organization Overview
-{report_tenant_name} is leveraging Microsoft Azure to enhance agility, scalability, and innovation while optimizing costs. This architecture assessment provides a comprehensive analysis of the current cloud environment to guide future architecture decisions.
-
-### 1.2. Current State Assessment
-Based on discovered resources, the architecture involves resources primarily in **{primary_regions}**. Network analysis suggests a **{network_topology_summary.lower()}** with multiple subscription boundaries defining security domains.
-
-* **Identity Foundation:** Entra ID tenant (`{identity_tenant_domain}`) manages authentication
-* **Network Architecture:** {network_topology_summary} connecting various application environments
-* **Security Posture:** {defender_status_list}
-* **Monitoring Coverage:** Multiple Log Analytics workspaces with varying levels of integration
-
-### 1.3. Critical Recommendations
-1. **Security Enhancement:** Address high priority Microsoft Defender for Cloud recommendations
-2. **Network Optimization:** Implement consistent network security patterns
-3. **Governance Maturity:** Enhance tagging strategy and policy compliance
-
-### 1.4. Target Architecture Vision
-Evolve toward a fully governed, enterprise-scale landing zone architecture with proper separation of concerns, comprehensive monitoring, and security controls aligned with industry best practices.
-
-## 2. Enterprise Organization Structure
-
-### 2.1. Management Group Hierarchy
-* **Current Structure:** {{MANAGEMENT_GROUP_HIERARCHY_PLACEHOLDER}}
-* **Governance Strategy:** Based on subscription organization patterns, governance appears to be managed primarily at the subscription level
-
-### 2.2. Subscription Strategy 
-* **Current Subscription Model:**
-{{SUBSCRIPTIONS_TABLE_PLACEHOLDER}}
-* **Subscription Purpose Analysis:** 
-{{SUBSCRIPTION_PURPOSE_PLACEHOLDER}}
-
-### 2.3. Resource Organization
-* **Resource Group Naming Patterns:** {{RESOURCE_GROUP_PATTERNS_PLACEHOLDER}}
-* **Resource Distribution:** Primary workload concentrations in {primary_regions}
-* **Resource Lifecycle Management:** {{RESOURCE_LIFECYCLE_PLACEHOLDER}}
-
-## 3. Identity & Access Management
-
-### 3.1. Identity Foundation
-* **Entra ID Tenant:** `{identity_tenant_domain}`
-* **Identity Synchronization:** {ad_connect_status}
-* **Authentication Methods:** {{AUTHENTICATION_METHODS_PLACEHOLDER}}
-
-### 3.2. Authorization Model
-* **RBAC Approach:** {{RBAC_APPROACH_PLACEHOLDER}}
-* **Custom Roles:** {{CUSTOM_ROLES_PLACEHOLDER}}
-* **Key Role Assignments:** See detailed table in Appendix
-
-### 3.3. Privileged Access
-* **Privileged Identity Management:** {pim_status}
-* **Just-In-Time Access:** {{JIT_ACCESS_PLACEHOLDER}}
-* **Privileged Access Workstations:** Not detected in the environment scan
-
-### 3.4. Application Identities
-* **Managed Identities:** {managed_identity_status}
-* **Service Principals:** {{SERVICE_PRINCIPALS_PLACEHOLDER}}
-
-## 4. Network Architecture
-
-### 4.1. Network Topology
-* **Virtual Networks:** 
-{{VNETS_TABLE_PLACEHOLDER}}
-* **Connectivity Model:** {network_topology_summary}
-* **VNet Peering Relationships:**
-{{PEERING_TABLE_PLACEHOLDER}}
-* **Route Tables:** {{ROUTE_TABLES_PLACEHOLDER}}
-
-### 4.2. Connectivity Architecture
-* **Hybrid Connectivity:**
-{{GATEWAYS_TABLE_PLACEHOLDER}}
-* **Internet Egress Strategy:** {{INTERNET_EGRESS_PLACEHOLDER}}
-* **Internet Ingress Points:**
-{{INGRESS_LIST_PLACEHOLDER}}
-
-### 4.3. Network Security
-* **Azure Firewalls:**
-{{FIREWALLS_TABLE_PLACEHOLDER}}
-* **Network Security Groups:** Applied to secure network traffic
-* **DDoS Protection:**
-{{DDOS_TABLE_PLACEHOLDER}}
-* **Web Application Firewalls:** {{WAF_PLACEHOLDER}}
-
-### 4.4. DNS Architecture
-* **Private DNS Zones:**
-{{PRIVATE_DNS_LIST_PLACEHOLDER}}
-* **Custom DNS Settings:**
-{{CUSTOM_DNS_LIST_PLACEHOLDER}}
-* **DNS Resolution Flows:** {{DNS_RESOLUTION_PLACEHOLDER}}
-
-### 4.5. Private Service Access
-* **Private Endpoints:**
-{{PRIVATE_ENDPOINTS_TABLE_PLACEHOLDER}}
-* **Service Endpoints:** {{SERVICE_ENDPOINTS_PLACEHOLDER}}
-* **Private Link Services:** {{PRIVATE_LINK_SERVICES_PLACEHOLDER}}
-
-## 5. Compute & Application Services
-
-### 5.1. Workload Patterns
-* **Infrastructure as a Service (IaaS):**
-{{VMS_TABLE_PLACEHOLDER}}
-* **Platform as a Service (PaaS):**
-{{APP_SERVICES_TABLE_PLACEHOLDER}}
-* **Serverless Components:** {{SERVERLESS_PLACEHOLDER}}
-
-### 5.2. Application Architectures
-* **Web Applications:** {{WEB_APPS_PLACEHOLDER}}
-* **API Services:** {{API_SERVICES_PLACEHOLDER}}
-* **Container Services:** {{CONTAINER_SERVICES_PLACEHOLDER}}
-
-### 5.3. Scaling & Resilience
-* **Auto-scaling Configurations:** {{AUTOSCALING_PLACEHOLDER}}
-* **Availability Patterns:** {{AVAILABILITY_PLACEHOLDER}}
-* **Load Balancing Strategy:** {{LOAD_BALANCING_PLACEHOLDER}}
-
-### 5.4. DevOps Integration
-* **Deployment Methods:** {{DEPLOYMENT_METHODS_PLACEHOLDER}}
-* **Environment Strategy:** {{ENVIRONMENT_STRATEGY_PLACEHOLDER}}
-* **CI/CD Integration:** {{CICD_PLACEHOLDER}}
-
-## 6. Data Platform
-
-### 6.1. Data Storage Strategy
-* **Storage Accounts:**
-{{STORAGE_ACCOUNTS_PLACEHOLDER}}
-* **Data Lake Architecture:** {{DATA_LAKE_PLACEHOLDER}}
-* **Backup Storage:** {{BACKUP_STORAGE_PLACEHOLDER}}
-
-### 6.2. Database Services
-* **Relational Databases:**
-{{RELATIONAL_DATABASES_PLACEHOLDER}}
-* **NoSQL Databases:**
-{{NOSQL_DATABASES_PLACEHOLDER}}
-* **Analytics Services:** {{ANALYTICS_SERVICES_PLACEHOLDER}}
-
-### 6.3. Data Protection
-* **Encryption Strategy:** {{ENCRYPTION_STRATEGY_PLACEHOLDER}}
-* **Data Classification:** {{DATA_CLASSIFICATION_PLACEHOLDER}}
-* **Data Sovereignty:** {{DATA_SOVEREIGNTY_PLACEHOLDER}}
-
-## 7. Security & Compliance
-
-### 7.1. Security Posture
-* **Microsoft Defender for Cloud:** {defender_status_list}
-* **Security Recommendations:** See detailed table in Appendix
-* **Vulnerability Management:** {{VULNERABILITY_MANAGEMENT_PLACEHOLDER}}
-
-### 7.2. Security Operations
-* **Microsoft Sentinel:** {sentinel_status_str}
-* **Security Monitoring:** {{SECURITY_MONITORING_PLACEHOLDER}}
-* **Threat Protection:** {{THREAT_PROTECTION_PLACEHOLDER}}
-
-### 7.3. Encryption & Key Management
-* **Key Vaults:**
-{{KEY_VAULTS_TABLE_PLACEHOLDER}}
-* **Access Model:** {{KEY_VAULT_ACCESS_MODEL_PLACEHOLDER}}
-* **Certificate Management:** {{CERTIFICATE_MANAGEMENT_PLACEHOLDER}}
-
-### 7.4. Compliance Framework
-* **Policy Compliance:** {{POLICY_COMPLIANCE_PLACEHOLDER}}
-* **Regulatory Considerations:** {compliance_text}
-* **Compliance Reporting:** {{COMPLIANCE_REPORTING_PLACEHOLDER}}
-
-## 8. Monitoring & Operations
-
-### 8.1. Monitoring Foundation
-* **Log Analytics Workspaces:**
-{{LOG_ANALYTICS_TABLE_PLACEHOLDER}}
-* **Monitoring Agents:** {{AGENT_STATUS_PLACEHOLDER}}
-* **Monitoring Coverage:** {{MONITORING_COVERAGE_PLACEHOLDER}}
-
-### 8.2. Operational Visibility
-* **Azure Monitor Configuration:** {{AZURE_MONITOR_PLACEHOLDER}}
-* **Application Monitoring:** {{APPLICATION_MONITORING_PLACEHOLDER}}
-* **Infrastructure Monitoring:** {{INFRASTRUCTURE_MONITORING_PLACEHOLDER}}
-
-### 8.3. Alerting & Notification Strategy
-* **Alert Rules Configuration:** {{ALERT_RULES_PLACEHOLDER}}
-* **Action Groups:** {{ACTION_GROUPS_PLACEHOLDER}}
-* **Service Health:** {{SERVICE_HEALTH_PLACEHOLDER}}
-
-### 8.4. IT Service Management Integration
-* **Incident Management:** {{INCIDENT_MANAGEMENT_PLACEHOLDER}}
-* **Change Management:** {{CHANGE_MANAGEMENT_PLACEHOLDER}}
-* **Service Catalog:** {{SERVICE_CATALOG_PLACEHOLDER}}
-
-## 9. Business Continuity & Disaster Recovery
-
-### 9.1. Resilience Architecture
-* **Regional Distribution:** Primary region: {primary_regions}
-* **Multi-Region Services:** {{CROSS_REGION_SERVICES_PLACEHOLDER}}
-* **Recovery Objectives:** {{RECOVERY_OBJECTIVES_PLACEHOLDER}}
-
-### 9.2. Backup Strategy
-* **Azure Backup Implementation:** {{BACKUP_STATUS_PLACEHOLDER}}
-* **Backup Policies:** {{BACKUP_POLICIES_PLACEHOLDER}}
-* **Backup Testing:** {{BACKUP_TESTING_PLACEHOLDER}}
-
-### 9.3. Disaster Recovery
-* **Azure Site Recovery:** {{ASR_STATUS_PLACEHOLDER}}
-* **DR Runbooks:** {{DR_RUNBOOKS_PLACEHOLDER}}
-* **DR Testing Strategy:** {{DR_TESTING_PLACEHOLDER}}
-
-## 10. Cost Management & Optimization
-
-### 10.1. Cost Structure
-* **Subscription Costs:** {{SUBSCRIPTION_COSTS_PLACEHOLDER}}
-* **Resource Type Distribution:** {{RESOURCE_TYPE_COSTS_PLACEHOLDER}}
-* **Cost Allocation:** {{COST_ALLOCATION_PLACEHOLDER}}
-
-### 10.2. Optimization Status
-* **Right-sizing Opportunities:** {{RIGHTSIZING_PLACEHOLDER}}
-* **Reserved Instances:** {{RESERVED_INSTANCES_PLACEHOLDER}}
-* **Hybrid Benefits:** {{HYBRID_BENEFITS_PLACEHOLDER}}
-
-### 10.3. Budget Controls
-* **Budget Configuration:** {{BUDGET_CONFIGURATION_PLACEHOLDER}}
-* **Cost Anomaly Detection:** {{COST_ANOMALY_PLACEHOLDER}}
-* **Showback/Chargeback:** {{SHOWBACK_PLACEHOLDER}}
-
-## 11. Governance & Compliance
-
-### 11.1. Policy Framework
-* **Key Assigned Policies/Initiatives:**
-{{POLICY_SUMMARY_PLACEHOLDER}}
-* **Non-Compliant Resources:** See detailed table in Appendix
-* **Custom Policies:** {{CUSTOM_POLICIES_PLACEHOLDER}}
-
-### 11.2. Resource Governance
-* **Tagging Strategy:**
-    * Common Tags: {{COMMON_TAGS_PLACEHOLDER}}
-    * Mandatory Tags: {{MANDATORY_TAGS_PLACEHOLDER}}
-* **Resource Lifecycle:** {{RESOURCE_LIFECYCLE_GOVERNANCE_PLACEHOLDER}}
-* **Technical Debt Management:** {{TECHNICAL_DEBT_PLACEHOLDER}}
-
-## 12. Roadmap & Recommendations
-
-### 12.1. Architecture Maturity Assessment
-* **Identity & Access Management:** {{IDENTITY_MATURITY_PLACEHOLDER}}
-* **Network Security:** {{NETWORK_MATURITY_PLACEHOLDER}}
-* **Security & Compliance:** {{SECURITY_MATURITY_PLACEHOLDER}}
-* **Operations Management:** {{OPERATIONS_MATURITY_PLACEHOLDER}}
-* **Overall Cloud Maturity Score:** {{MATURITY_SCORE_PLACEHOLDER}}
-
-### 12.2. Strategic Initiatives
-* **Short-term Priorities:** {{SHORT_TERM_PRIORITIES_PLACEHOLDER}}
-* **Medium-term Projects:** {{MEDIUM_TERM_PLACEHOLDER}}
-* **Long-term Vision:** {{LONG_TERM_PLACEHOLDER}}
-
-### 12.3. Implementation Plan
-* **Quick Wins:** {{QUICK_WINS_PLACEHOLDER}}
-* **Major Milestones:** {{MAJOR_MILESTONES_PLACEHOLDER}}
-* **Critical Dependencies:** {{CRITICAL_DEPENDENCIES_PLACEHOLDER}}
-
-## 13. Landing Zone Design & Examples
-
-### 13.1. Target Landing Zone Model
-* **Landing Zone Types:** {{LANDING_ZONE_TYPES_PLACEHOLDER}}
-* **Platform vs. Application Responsibilities:** {{PLATFORM_RESPONSIBILITIES_PLACEHOLDER}}
-* **Common Service Integration:** {{COMMON_SERVICES_PLACEHOLDER}}
-
-### 13.2. Example Landing Zones
-{{LANDING_ZONE_EXAMPLES_PLACEHOLDER}}
-
-## 14. Appendix - Technical Details
-
-### 14.1. Reference Architecture Diagrams
-* **Enterprise-level Network Topology:**
-<!-- Placeholder for the image tag. We will replace this based on the diagram path -->
-{{TENANT_DIAGRAM_IMAGE_TAG_PLACEHOLDER}}
-
-* **Subscription Network Diagrams:**
-{{SUBSCRIPTION_DIAGRAMS_PLACEHOLDER}}
-
-### 14.2. Resource Inventory
-* **Key Statistics:**
-  * Total Subscriptions: {{SUBSCRIPTION_COUNT_PLACEHOLDER}}
-  * Total Resources: {{RESOURCE_COUNT_PLACEHOLDER}}
-  * Total VNets: {{VNET_COUNT_PLACEHOLDER}}
-  * Total Subnets: {{SUBNET_COUNT_PLACEHOLDER}}
-
-### 14.3. Security Findings
-* **Security Recommendations (High/Medium):**
-{{SECURITY_RECS_TABLE_PLACEHOLDER}}
-
-### 14.4. Policy Details
-* **Non-Compliant Policy States:**
-{{POLICY_STATES_TABLE_PLACEHOLDER}}
-
-### 14.5. Role Assignments
-* **Privileged Role Assignments:**
-{{PRIVILEGED_ROLES_TABLE_PLACEHOLDER}}
-
-"""
-
-    # --- Populate Placeholders --- 
-    replacements = {}
-    diagram_dir_abs = os.path.abspath(os.path.join(report_path_dir, '../diagrams')) # Absolute path to diagram dir
-
-    # Section 14.1: Diagrams 
-    # Determine the Tenant Diagram Image Tag
-    tenant_diagram_image_tag = "_Tenant-wide network diagram not generated or found._"
-    tenant_diagram_info = diagram_paths.get("tenant_diagrams", {})
-    tenant_diagram_filename = tenant_diagram_info.get("network_topology") # Expecting filename
-
-    if tenant_diagram_filename and isinstance(tenant_diagram_filename, str):
-        full_diagram_path = os.path.join(diagram_dir_abs, tenant_diagram_filename)
-        if os.path.exists(full_diagram_path):
-            try:
-                # Calculate relative path for the link
-                relative_path = os.path.join("../diagrams", tenant_diagram_filename).replace("\\", "/")
-                # Generate the HTML <img> tag directly
-                tenant_diagram_image_tag = f'<img alt="Tenant Network Diagram" src="{relative_path}" />'
-            except Exception as e:
-                logging.warning(f"Could not calculate relative path for tenant diagram: {e}")
-                tenant_diagram_image_tag = f"_Error creating path for {tenant_diagram_filename}_"
-        else:
-            logging.warning(f"Tenant diagram file not found at {full_diagram_path} (Filename: {tenant_diagram_filename})")
-            tenant_diagram_image_tag = f"_Diagram file not found ({tenant_diagram_filename})_"
-    elif tenant_diagram_info:
-         logging.warning(f"Tenant diagram info found but filename is invalid: {tenant_diagram_filename}")
-         
-    # Use the new placeholder for the image tag
-    replacements["{{TENANT_DIAGRAM_IMAGE_TAG_PLACEHOLDER}}"] = tenant_diagram_image_tag
-    # Pass report_path_dir to helper for relative path calculation
-    replacements["{{SUBSCRIPTION_DIAGRAMS_PLACEHOLDER}}"] = _get_subscription_diagram_links(all_data, diagram_paths, report_path_dir)
-
-    # Section 2.2: Subscription Strategy
-    replacements["{{SUBSCRIPTIONS_TABLE_PLACEHOLDER}}"] = _get_subscriptions_table(all_data)
-    replacements["{{SUBSCRIPTION_PURPOSE_PLACEHOLDER}}"] = "Based on resource distribution, subscriptions appear to be organized by workload type."
+    # Analyze overall approach
+    if role_assignment_counts["group"] > role_assignment_counts["user"]:
+        rbac_summary.append("**Group-based approach**: Majority of assignments are to Azure AD groups")
+    else:
+        rbac_summary.append("**Direct assignment approach**: Majority of assignments are directly to users")
     
-    # Section 2.1, 2.3: Enterprise Organization Structure
-    replacements["{{MANAGEMENT_GROUP_HIERARCHY_PLACEHOLDER}}"] = "_Management group hierarchy not detected in the audit. Consider implementing a structured hierarchy aligned with organizational needs._"
-    # Use new helper
-    replacements["{{RESOURCE_GROUP_PATTERNS_PLACEHOLDER}}"] = _analyze_rg_naming_patterns(all_data)
-    # Use new helper
-    replacements["{{RESOURCE_LIFECYCLE_PLACEHOLDER}}"] = _analyze_resource_lifecycle(all_data)
+    # Analyze custom vs built-in
+    built_in_percentage = (role_assignment_counts["built_in"] / total_assignments) * 100
+    rbac_summary.append(f"**{built_in_percentage:.1f}%** of roles are built-in (vs. custom)")
     
-    # Section 3: Identity
-    replacements["{{AUTHENTICATION_METHODS_PLACEHOLDER}}"] = "Entra ID authentication is in use, but specific methods like MFA enforcement require detailed configuration access."
-    # Use new helper
-    replacements["{{RBAC_APPROACH_PLACEHOLDER}}"] = _analyze_rbac_approach(all_data)
-    replacements["{{CUSTOM_ROLES_PLACEHOLDER}}"] = "_Custom role definitions were not detected in the environment scan._"
-    replacements["{{JIT_ACCESS_PLACEHOLDER}}"] = "_Just-in-time access not detected in the environment scan._"
-    # Use new helper
-    replacements["{{SERVICE_PRINCIPALS_PLACEHOLDER}}"] = _analyze_service_principals(all_data)
+    # Analyze scope distribution
+    if role_assignment_counts["resource_group"] > role_assignment_counts["subscription"] and role_assignment_counts["resource_group"] > role_assignment_counts["resource"]:
+        rbac_summary.append("**Resource group-focused**: Most permissions granted at resource group level")
+    elif role_assignment_counts["subscription"] > role_assignment_counts["resource_group"] and role_assignment_counts["subscription"] > role_assignment_counts["resource"]:
+        rbac_summary.append("**Subscription-focused**: Most permissions granted at subscription level")
+    else:
+        rbac_summary.append("**Resource-focused**: Most permissions granted at individual resource level")
     
-    # Section 4.1: Network Topology
-    replacements["{{VNETS_TABLE_PLACEHOLDER}}"] = _get_vnets_table(all_data)
-    replacements["{{PEERING_TABLE_PLACEHOLDER}}"] = _get_peering_table(all_data)
-    replacements["{{ROUTE_TABLES_PLACEHOLDER}}"] = "_Route table analysis requires deeper inspection of UDRs._"
+    # Add common roles
+    sorted_roles = sorted(common_roles.items(), key=lambda x: x[1], reverse=True)
+    if sorted_roles:
+        top_roles = [f"'{role}'" for role, count in sorted_roles[:3]]
+        rbac_summary.append(f"**Common roles**: {', '.join(top_roles)}")
     
-    # Section 4.2: Connectivity
-    replacements["{{GATEWAYS_TABLE_PLACEHOLDER}}"] = _get_gateways_table(all_data)
-    replacements["{{INGRESS_LIST_PLACEHOLDER}}"] = _get_internet_ingress_list(all_data)
-    replacements["{{INTERNET_EGRESS_PLACEHOLDER}}"] = _analyze_internet_egress(all_data)
-    
-    # Section 4.3: Network Security
-    replacements["{{FIREWALLS_TABLE_PLACEHOLDER}}"] = _get_firewalls_table(all_data)
-    replacements["{{DDOS_TABLE_PLACEHOLDER}}"] = _get_ddos_table(all_data)
-    replacements["{{WAF_PLACEHOLDER}}"] = "_Web Application Firewall configuration not detected in the environment scan._"
-    
-    # Section 4.4-4.5: DNS & Private Access
-    private_zones_list, custom_dns_list = _get_dns_details(all_data)
-    replacements["{{PRIVATE_DNS_LIST_PLACEHOLDER}}"] = private_zones_list
-    replacements["{{CUSTOM_DNS_LIST_PLACEHOLDER}}"] = custom_dns_list
-    replacements["{{DNS_RESOLUTION_PLACEHOLDER}}"] = "_DNS resolution flow analysis requires detailed configuration inspection._"
-    replacements["{{PRIVATE_ENDPOINTS_TABLE_PLACEHOLDER}}"] = _get_private_endpoints_table(all_data)
-    # Use new helper for Service Endpoints
-    replacements["{{SERVICE_ENDPOINTS_PLACEHOLDER}}"] = _get_service_endpoints_summary(all_data)
-    # Use new helper for Private Link Services
-    replacements["{{PRIVATE_LINK_SERVICES_PLACEHOLDER}}"] = _get_private_link_services_table(all_data)
+    if rbac_summary:
+        return "\n".join(rbac_summary)
+    else:
+        return "_No clear RBAC patterns detected._"
 
-    # Section 5: Compute & Application Services
-    replacements["{{APP_SERVICES_TABLE_PLACEHOLDER}}"] = _get_app_services_table(all_data)
-    replacements["{{VMS_TABLE_PLACEHOLDER}}"] = _get_vms_table(all_data)
-    replacements["{{SERVERLESS_PLACEHOLDER}}"] = _get_serverless_summary(all_data)
-    # Use new helpers
-    replacements["{{WEB_APPS_PLACEHOLDER}}"] = _summarize_web_apps(all_data)
-    replacements["{{API_SERVICES_PLACEHOLDER}}"] = _summarize_api_services(all_data)
-    replacements["{{CONTAINER_SERVICES_PLACEHOLDER}}"] = _summarize_container_services(all_data)
-    # Keep others static for now
-    replacements["{{AUTOSCALING_PLACEHOLDER}}"] = "_Auto-scaling configuration analysis requires detailed resource inspection._"
-    replacements["{{AVAILABILITY_PLACEHOLDER}}"] = "_Availability pattern analysis requires detailed configuration inspection._"
-    replacements["{{LOAD_BALANCING_PLACEHOLDER}}"] = "_Load balancing strategy analysis requires detailed configuration inspection._"
-    replacements["{{DEPLOYMENT_METHODS_PLACEHOLDER}}"] = "_Deployment method analysis requires historical deployment data._"
-    replacements["{{ENVIRONMENT_STRATEGY_PLACEHOLDER}}"] = "_Environment strategy analysis requires detailed resource tagging inspection._"
-    replacements["{{CICD_PLACEHOLDER}}"] = "_CI/CD integration analysis requires external system integration information._"
-    
-    # Section 6: Data Platform
-    replacements["{{STORAGE_ACCOUNTS_PLACEHOLDER}}"] = _get_storage_accounts_table(all_data)
-    replacements["{{DATA_LAKE_PLACEHOLDER}}"] = _get_data_lake_analysis(all_data)
-    replacements["{{BACKUP_STORAGE_PLACEHOLDER}}"] = _get_backup_storage_analysis(all_data)
-    replacements["{{RELATIONAL_DATABASES_PLACEHOLDER}}"] = _get_databases_table(all_data)
-    replacements["{{NOSQL_DATABASES_PLACEHOLDER}}"] = _get_databases_table(all_data, db_type="nosql")
-    replacements["{{ANALYTICS_SERVICES_PLACEHOLDER}}"] = _get_analytics_services_table(all_data)
-    replacements["{{ENCRYPTION_STRATEGY_PLACEHOLDER}}"] = _get_encryption_strategy_summary(all_data)
-    replacements["{{DATA_CLASSIFICATION_PLACEHOLDER}}"] = _get_data_classification_analysis(all_data)
-    replacements["{{DATA_SOVEREIGNTY_PLACEHOLDER}}"] = _get_data_sovereignty_analysis(all_data)
-    
-    # Section 7: Security & Compliance
-    replacements["{{KEY_VAULTS_TABLE_PLACEHOLDER}}"] = _get_key_vaults_table(all_data)
-    replacements["{{KEY_VAULT_ACCESS_MODEL_PLACEHOLDER}}"] = _get_key_vault_access_model(all_data)
-    replacements["{{VULNERABILITY_MANAGEMENT_PLACEHOLDER}}"] = "_Vulnerability management analysis requires detailed security center integration inspection._"
-    replacements["{{SECURITY_MONITORING_PLACEHOLDER}}"] = "_Security monitoring analysis requires detailed diagnostic setting inspection._"
-    replacements["{{THREAT_PROTECTION_PLACEHOLDER}}"] = "_Threat protection analysis requires detailed security center integration inspection._"
-    replacements["{{CERTIFICATE_MANAGEMENT_PLACEHOLDER}}"] = "_Certificate management analysis requires detailed key vault inspection._"
-    replacements["{{POLICY_COMPLIANCE_PLACEHOLDER}}"] = "See non-compliant policy states in Appendix."
-    replacements["{{COMPLIANCE_REPORTING_PLACEHOLDER}}"] = "_Compliance reporting analysis requires detailed policy assignment inspection._"
-    
-    # Section 8: Monitoring & Operations
-    replacements["{{LOG_ANALYTICS_TABLE_PLACEHOLDER}}"] = _get_log_analytics_workspaces_table(all_data)
-    replacements["{{AGENT_STATUS_PLACEHOLDER}}"] = _get_agent_status_summary(all_data)
-    replacements["{{MONITORING_COVERAGE_PLACEHOLDER}}"] = "_Monitoring coverage analysis requires detailed diagnostic setting inspection._"
-    replacements["{{AZURE_MONITOR_PLACEHOLDER}}"] = "_Azure Monitor configuration analysis requires detailed alert rule inspection._"
-    replacements["{{APPLICATION_MONITORING_PLACEHOLDER}}"] = "_Application monitoring analysis requires detailed Application Insights inspection._"
-    replacements["{{INFRASTRUCTURE_MONITORING_PLACEHOLDER}}"] = "_Infrastructure monitoring analysis requires detailed VM insights inspection._"
-    replacements["{{ALERT_RULES_PLACEHOLDER}}"] = "_Alert rule analysis requires detailed alert configuration inspection._"
-    replacements["{{ACTION_GROUPS_PLACEHOLDER}}"] = "_Action group analysis requires detailed alert configuration inspection._"
-    replacements["{{SERVICE_HEALTH_PLACEHOLDER}}"] = "_Service health alert analysis requires detailed alert configuration inspection._"
-    replacements["{{INCIDENT_MANAGEMENT_PLACEHOLDER}}"] = "_Incident management analysis requires external system integration information._"
-    replacements["{{CHANGE_MANAGEMENT_PLACEHOLDER}}"] = "_Change management analysis requires external system integration information._"
-    replacements["{{SERVICE_CATALOG_PLACEHOLDER}}"] = "_Service catalog analysis requires external system integration information._"
-    
-    # Section 9: Business Continuity & Disaster Recovery
-    replacements["{{CROSS_REGION_SERVICES_PLACEHOLDER}}"] = _get_cross_region_services(all_data)
-    replacements["{{BACKUP_STATUS_PLACEHOLDER}}"] = _get_backup_status_summary(all_data)
-    replacements["{{ASR_STATUS_PLACEHOLDER}}"] = _get_asr_status(all_data)
-    replacements["{{RECOVERY_OBJECTIVES_PLACEHOLDER}}"] = "_Recovery objective analysis requires detailed business impact analysis._"
-    replacements["{{BACKUP_POLICIES_PLACEHOLDER}}"] = "_Backup policy analysis requires detailed recovery services vault inspection._"
-    replacements["{{BACKUP_TESTING_PLACEHOLDER}}"] = "_Backup testing analysis requires operational procedure documentation._"
-    replacements["{{DR_RUNBOOKS_PLACEHOLDER}}"] = "_DR runbook analysis requires operational procedure documentation._"
-    replacements["{{DR_TESTING_PLACEHOLDER}}"] = "_DR testing analysis requires operational procedure documentation._"
-    
-    # Section 10: Cost Management & Optimization
-    # Use the new helper for MTD Costs
-    replacements["{{SUBSCRIPTION_COSTS_PLACEHOLDER}}"] = _get_cost_summary_table(all_data)
-    # Keep other placeholders with generic text for now, as detailed fetchers are not implemented
-    replacements["{{RESOURCE_TYPE_COSTS_PLACEHOLDER}}"] = "_Resource type cost distribution requires detailed billing data._"
-    replacements["{{COST_ALLOCATION_PLACEHOLDER}}"] = "_Cost allocation analysis requires detailed tagging and billing data._"
-    replacements["{{RIGHTSIZING_PLACEHOLDER}}"] = "_Right-sizing analysis requires resource utilization data._"
-    replacements["{{RESERVED_INSTANCES_PLACEHOLDER}}"] = "_Reserved instance analysis requires billing data access._"
-    replacements["{{HYBRID_BENEFITS_PLACEHOLDER}}"] = "_Hybrid benefit analysis requires license inspection._"
-    replacements["{{BUDGET_CONFIGURATION_PLACEHOLDER}}"] = "_Budget configuration analysis requires billing data access._"
-    replacements["{{COST_ANOMALY_PLACEHOLDER}}"] = "_Cost anomaly detection requires billing data access._"
-    replacements["{{SHOWBACK_PLACEHOLDER}}"] = "_Showback/chargeback analysis requires tagging and billing data._"
-    
-    # Section 11: Governance & Compliance
-    replacements["{{POLICY_SUMMARY_PLACEHOLDER}}"] = _get_policy_assignments_summary(all_data)
-    common_tags, mandatory_tags = _get_tagging_analysis(all_data)
-    replacements["{{COMMON_TAGS_PLACEHOLDER}}"] = common_tags
-    replacements["{{MANDATORY_TAGS_PLACEHOLDER}}"] = mandatory_tags
-    replacements["{{CUSTOM_POLICIES_PLACEHOLDER}}"] = "_Custom policy analysis requires detailed policy definition inspection._"
-    # Use new helper
-    replacements["{{RESOURCE_LIFECYCLE_GOVERNANCE_PLACEHOLDER}}"] = _analyze_lifecycle_policies(all_data)
-    replacements["{{TECHNICAL_DEBT_PLACEHOLDER}}"] = "_Technical debt analysis requires detailed resource age and version inspection._"
-    
-    # Section 12: Roadmap & Recommendations
-    replacements["{{IDENTITY_MATURITY_PLACEHOLDER}}"] = "_Identity maturity assessment requires detailed Entra ID configuration inspection._"
-    replacements["{{NETWORK_MATURITY_PLACEHOLDER}}"] = "_Network maturity assessment requires detailed network configuration inspection._"
-    replacements["{{SECURITY_MATURITY_PLACEHOLDER}}"] = "_Security maturity assessment requires detailed security configuration inspection._"
-    replacements["{{OPERATIONS_MATURITY_PLACEHOLDER}}"] = "_Operations maturity assessment requires detailed operational procedure documentation._"
-    replacements["{{MATURITY_SCORE_PLACEHOLDER}}"] = "_Overall maturity score requires comprehensive assessment across all domains._"
-    replacements["{{SHORT_TERM_PRIORITIES_PLACEHOLDER}}"] = "_Short-term priorities require consultation with business stakeholders._"
-    replacements["{{MEDIUM_TERM_PLACEHOLDER}}"] = "_Medium-term projects require consultation with business stakeholders._"
-    replacements["{{LONG_TERM_PLACEHOLDER}}"] = "_Long-term vision requires consultation with business stakeholders._"
-    replacements["{{QUICK_WINS_PLACEHOLDER}}"] = "_Quick wins require consultation with business stakeholders._"
-    replacements["{{MAJOR_MILESTONES_PLACEHOLDER}}"] = "_Major milestones require consultation with business stakeholders._"
-    replacements["{{CRITICAL_DEPENDENCIES_PLACEHOLDER}}"] = "_Critical dependencies require consultation with business stakeholders._"
-    
-    # Section 13: Landing Zone Design
-    replacements["{{LANDING_ZONE_TYPES_PLACEHOLDER}}"] = "_Landing zone type analysis requires detailed subscription purpose inspection._"
-    replacements["{{PLATFORM_RESPONSIBILITIES_PLACEHOLDER}}"] = "_Platform vs. application responsibilities require operational model documentation._"
-    replacements["{{COMMON_SERVICES_PLACEHOLDER}}"] = "_Common service integration analysis requires detailed resource inspection._"
-    replacements["{{LANDING_ZONE_EXAMPLES_PLACEHOLDER}}"] = _get_landing_zone_examples(all_data)
-    
-    # Section 14: Appendix
-    # Calculate some high level statistics
-    subscription_count = len(all_data)
-    resource_count = 0
-    vnet_count = 0
-    subnet_count = 0
-    
-    for sub_id, data in all_data.items():
-        if "error" in data: continue
-        resources = data.get("resources", [])
-        resource_count += len(resources)
-        vnets = data.get("networking", {}).get("vnets", [])
-        vnet_count += len(vnets)
-        subnets = data.get("networking", {}).get("subnets", [])
-        subnet_count += len(subnets)
-    
-    replacements["{{SUBSCRIPTION_COUNT_PLACEHOLDER}}"] = str(subscription_count)
-    replacements["{{RESOURCE_COUNT_PLACEHOLDER}}"] = str(resource_count)
-    replacements["{{VNET_COUNT_PLACEHOLDER}}"] = str(vnet_count)
-    replacements["{{SUBNET_COUNT_PLACEHOLDER}}"] = str(subnet_count)
-    
-    # Security findings and compliance details
-    replacements["{{POLICY_STATES_TABLE_PLACEHOLDER}}"] = _get_policy_states_table(all_data)
-    replacements["{{SECURITY_RECS_TABLE_PLACEHOLDER}}"] = _get_security_recs_table(all_data)
-    replacements["{{PRIVILEGED_ROLES_TABLE_PLACEHOLDER}}"] = _get_privileged_roles_table(all_data)
-
-    # --- Perform all replacements --- 
-    final_doc_content = design_template
-    # Add the loop to iterate through the replacements dictionary
-    for placeholder, value in replacements.items():
-        # Ensure value is a string before replacing
-        str_value = str(value) if value is not None else "_Data not available or error._" 
-        
-        # Ensure proper separation for multi-line content (like tables)
-        if isinstance(str_value, str) and '\\n' in str_value and str_value.strip().startswith('|'):
-             # Add extra newline before/after if it looks like a table and isn't just placeholder text
-             if not str_value.startswith("_"): 
-                 str_value = "\\n" + str_value.strip() + "\\n" # Ensure separation
-
-        # Try both formats of the placeholder
-        final_doc_content = final_doc_content.replace(placeholder, str_value)
-        # Also replace any single-brace version that might have been introduced
-        single_brace_placeholder = placeholder.replace("{{", "{").replace("}}", "}")
-        final_doc_content = final_doc_content.replace(single_brace_placeholder, str_value)
-
-    # --- Write to File ---
-    # Create reports directory if it doesn't exist
-    report_path_dir = os.path.join(base_output_dir, REPORT_DIR)
-    os.makedirs(report_path_dir, exist_ok=True)
-
-    # Define filename
-    filename = f"Azure_Design_Document_{timestamp_str}.md"
-    report_filepath = os.path.join(report_path_dir, filename)
-    
-    try:
-        with open(report_filepath, "w", encoding='utf-8') as f:
-            f.write(final_doc_content) # Write the content AFTER replacements
-        if not SILENT_MODE:
-            print(f"\nSuccessfully generated Design Document: {report_filepath}")
-        logging.info(f"Successfully generated Design Document: {report_filepath}")
-    except Exception as e:
-        if not SILENT_MODE:
-            print(f"\n!!! Error writing Design Document to {report_filepath}: {e}")
-        logging.error(f"Error writing Design Document: {e}")
-        report_filepath = None # Indicate failure
-
-    return report_filepath
-
-# --- Data Platform Section Helpers ---
-
-def _get_storage_accounts_table(all_data):
-    """Generates Markdown table for Storage Accounts."""
-    headers = ["Subscription", "Name", "Type", "Tier/SKU", "Access Tier", "Region", "Replication"]
-    rows = []
-    for sub_id, data in all_data.items():
-        if "error" in data: continue
-        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        resources = data.get("resources", [])
-        for res in resources:
-            if isinstance(res, dict) and res.get("type", "").lower() == "microsoft.storage/storageaccounts":
-                name = res.get("name", "Unknown")
-                location = res.get("location", "Unknown")
-                
-                # Extract SKU information
-                sku = res.get("sku", {})
-                sku_name = sku.get("name", "Unknown") if isinstance(sku, dict) else "Unknown"
-                
-                # Parse components of the SKU name (e.g., Standard_LRS, Premium_ZRS)
-                tier = "Standard"
-                replication = "LRS"
-                if isinstance(sku_name, str):
-                    if "_" in sku_name:
-                        parts = sku_name.split("_")
-                        if len(parts) >= 2:
-                            tier = parts[0]
-                            replication = parts[1]
-                
-                # Extract additional properties
-                properties = res.get("properties", {})
-                kind = res.get("kind", "Unknown")
-                if kind == "StorageV2":
-                    kind = "General Purpose v2"
-                elif kind == "BlobStorage":
-                    kind = "Blob Storage"
-                elif kind == "FileStorage":
-                    kind = "File Storage"
-                
-                # Get access tier (Hot/Cool)
-                access_tier = properties.get("accessTier", "Unknown")
-                
-                rows.append([
-                    sub_name, 
-                    name, 
-                    kind, 
-                    tier, 
-                    access_tier,
-                    location, 
-                    replication
-                ])
-    
-    if not rows:
-        return "_No Storage Accounts detected in the environment._"
-    
-    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
-
-def _get_data_lake_analysis(all_data):
-    """Analyzes storage accounts for data lake features."""
-    data_lake_gen2_count = 0
-    data_lake_gen1_count = 0
-    hierarchy_enabled_storage = 0
-    
-    # Track which subscriptions have data lakes
-    subscriptions_with_lakes = set()
-    storage_details = []
-    
-    for sub_id, data in all_data.items():
-        if "error" in data: continue
-        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        
-        # Check for Data Lake Storage Gen1
-        resources = data.get("resources", [])
-        for res in resources:
-            if isinstance(res, dict):
-                res_type = res.get("type", "").lower()
-                
-                # Check for Gen1 Data Lake Store
-                if res_type == "microsoft.datalakestore/accounts":
-                    data_lake_gen1_count += 1
-                    subscriptions_with_lakes.add(sub_name)
-                    storage_details.append(f"- **{res.get('name', 'Unknown')}** (Gen1, {sub_name})")
-                
-                # Check for Gen2 Data Lake Storage (Storage Account with hierarchical namespace)
-                elif res_type == "microsoft.storage/storageaccounts":
-                    properties = res.get("properties", {})
-                    is_hns_enabled = properties.get("isHnsEnabled", False)
-                    
-                    if is_hns_enabled:
-                        data_lake_gen2_count += 1
-                        hierarchy_enabled_storage += 1
-                        subscriptions_with_lakes.add(sub_name)
-                        storage_details.append(f"- **{res.get('name', 'Unknown')}** (Gen2, {sub_name})")
-    
-    # Build analysis text
-    if data_lake_gen1_count == 0 and data_lake_gen2_count == 0:
-        return "_No Data Lake Storage detected. No Storage Accounts with hierarchical namespace were found._"
-    
-    analysis = []
-    total_lakes = data_lake_gen1_count + data_lake_gen2_count
-    
-    analysis.append(f"**Data Lake Storage:** Detected {total_lakes} Data Lake Storage accounts across {len(subscriptions_with_lakes)} subscription(s)")
-    
-    if data_lake_gen1_count > 0:
-        analysis.append(f"- {data_lake_gen1_count}x Data Lake Storage Gen1 accounts")
-    
-    if data_lake_gen2_count > 0:
-        analysis.append(f"- {data_lake_gen2_count}x Data Lake Storage Gen2 accounts (Storage Accounts with hierarchical namespace)")
-    
-    if storage_details:
-        analysis.append("\n**Individual Data Lake Storage accounts:**")
-        analysis.extend(storage_details)
-    
-    return "\n".join(analysis)
-
-def _get_databases_table(all_data, db_type="relational"):
-    """Generates Markdown table for database services.
+def _analyze_pim_status(all_data):
+    """Analyzes whether Privileged Identity Management (PIM) appears to be in use.
     
     Args:
-        all_data: The aggregated data from all fetchers
-        db_type: Either "relational" or "nosql" to filter database types
-    """
-    headers = ["Subscription", "Name", "Type", "Tier/SKU", "Region", "Version"]
-    rows = []
-    
-    # Define which resource types to look for based on db_type
-    if db_type == "relational":
-        target_types = [
-            "microsoft.sql/servers",
-            "microsoft.dbforpostgresql/servers", 
-            "microsoft.dbformysql/servers",
-            "microsoft.dbformysql/flexibleservers",
-            "microsoft.dbforpostgresql/flexibleservers",
-            "microsoft.sql/managedinstances"
-        ]
-    else:  # nosql
-        target_types = [
-            "microsoft.documentdb/databaseaccounts",  # Cosmos DB
-            "microsoft.cache/redis",                  # Redis Cache
-            "microsoft.timeseriesinsights/environments", # Time Series Insights
-            "microsoft.appconfiguration/configurationstores" # App Configuration
-        ]
-    
-    for sub_id, data in all_data.items():
-        if "error" in data: continue
-        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        resources = data.get("resources", [])
+        all_data (dict): Dictionary of subscription data from fetchers.
         
-        for res in resources:
-            if not isinstance(res, dict): continue
-            res_type = res.get("type", "").lower()
-            
-            if res_type in target_types:
-                name = res.get("name", "Unknown")
-                location = res.get("location", "Unknown")
-                
-                # Extract sku and version information based on resource type
-                sku_name = "Unknown"
-                version = "Unknown"
-                db_type_display = "Unknown"
-                
-                if "sql/servers" in res_type:
-                    db_type_display = "Azure SQL Server"
-                    # Try to get details from child databases if available
-                    child_dbs = [r for r in resources if isinstance(r, dict) and 
-                                r.get("type", "").lower() == "microsoft.sql/servers/databases" and
-                                name in r.get("id", "").lower()]
-                    if child_dbs:
-                        for db in child_dbs:
-                            db_sku = db.get("sku", {})
-                            if isinstance(db_sku, dict) and "name" in db_sku:
-                                sku_name = db_sku["name"]
-                                break
-                
-                elif "dbforpostgresql" in res_type:
-                    db_type_display = "PostgreSQL"
-                    if "flexibleservers" in res_type:
-                        db_type_display += " Flexible"
-                    sku = res.get("sku", {})
-                    if isinstance(sku, dict):
-                        sku_name = sku.get("name", "Unknown")
-                    properties = res.get("properties", {})
-                    version = properties.get("version", "Unknown")
-                
-                elif "dbformysql" in res_type:
-                    db_type_display = "MySQL"
-                    if "flexibleservers" in res_type:
-                        db_type_display += " Flexible"
-                    sku = res.get("sku", {})
-                    if isinstance(sku, dict):
-                        sku_name = sku.get("name", "Unknown")
-                    properties = res.get("properties", {})
-                    version = properties.get("version", "Unknown")
-                
-                elif "managedinstances" in res_type:
-                    db_type_display = "SQL Managed Instance"
-                    sku = res.get("sku", {})
-                    if isinstance(sku, dict):
-                        sku_name = sku.get("name", "Unknown")
-                
-                elif "documentdb" in res_type:
-                    db_type_display = "Cosmos DB"
-                    properties = res.get("properties", {})
-                    # Identify Cosmos DB API type
-                    capabilities = properties.get("capabilities", [])
-                    if isinstance(capabilities, list):
-                        api_types = []
-                        for cap in capabilities:
-                            if isinstance(cap, dict) and cap.get("name") in ["EnableCassandra", "EnableGremlin", "EnableTable", "EnableMongo"]:
-                                api_type = cap.get("name").replace("Enable", "")
-                                api_types.append(api_type)
-                        if api_types:
-                            version = f"API: {', '.join(api_types)}"
-                        else:
-                            version = "API: SQL (Core)"
-                
-                elif "redis" in res_type:
-                    db_type_display = "Redis Cache"
-                    sku = res.get("sku", {})
-                    if isinstance(sku, dict):
-                        sku_name = sku.get("name", "Basic")  # Default to Basic if not specified
-                    properties = res.get("properties", {})
-                    version = properties.get("redisVersion", "Unknown")
-                
-                rows.append([
-                    sub_name,
-                    name,
-                    db_type_display,
-                    sku_name,
-                    location,
-                    version
-                ])
+    Returns:
+        str: Markdown-formatted summary of PIM status.
+    """
+    if not all_data:
+        return "_No subscription data available for PIM analysis._"
     
-    if not rows:
-        return f"_No {db_type.title()} Database services detected in the environment._"
-    
-    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[2], x[1])))
-
-def _get_analytics_services_table(all_data):
-    """Generates Markdown table for analytics services."""
-    headers = ["Subscription", "Service", "Name", "Type", "Region"]
-    rows = []
-    
-    # Define analytics service types to look for
-    analytics_types = {
-        "microsoft.synapse/workspaces": "Synapse Analytics",
-        "microsoft.databricks/workspaces": "Databricks",
-        "microsoft.datafactory/factories": "Data Factory",
-        "microsoft.hdinsight/clusters": "HDInsight",
-        "microsoft.streamanalytics/streamingjobs": "Stream Analytics",
-        "microsoft.analysisservices/servers": "Analysis Services",
-        "microsoft.machinelearningservices/workspaces": "Machine Learning",
-        "microsoft.batch/batchaccounts": "Batch"
+    # Look for PIM-eligible role assignments which would indicate PIM is in use
+    pim_indicators = {
+        "eligible_assignments": 0,
+        "activated_assignments": 0
     }
     
     for sub_id, data in all_data.items():
-        if "error" in data: continue
+        if "error" in data or "security" not in data:
+            continue
+        
+        # Check for PIM eligible assignments
+        role_assignments = data["security"].get("role_assignments", [])
+        for assignment in role_assignments:
+            if not isinstance(assignment, dict):
+                continue
+            
+            # Check for PIM eligibility properties
+            if assignment.get("pim_eligible", False):
+                pim_indicators["eligible_assignments"] += 1
+            
+            if assignment.get("pim_activated", False):
+                pim_indicators["activated_assignments"] += 1
+    
+    # Make a determination based on indicators
+    if pim_indicators["eligible_assignments"] > 0 or pim_indicators["activated_assignments"] > 0:
+        status = []
+        if pim_indicators["eligible_assignments"] > 0:
+            status.append(f"{pim_indicators['eligible_assignments']} eligible assignments")
+        if pim_indicators["activated_assignments"] > 0:
+            status.append(f"{pim_indicators['activated_assignments']} activated assignments")
+        
+        return f"Privileged Identity Management appears to be enabled ({', '.join(status)})"
+    else:
+        return "No indicators of Privileged Identity Management (PIM) usage detected"
+
+def _analyze_managed_identity_usage(all_data):
+    """Analyzes the usage patterns of managed identities in the environment.
+    
+    Args:
+        all_data (dict): Dictionary of subscription data from fetchers.
+        
+    Returns:
+        str: Markdown-formatted summary of managed identity usage.
+    """
+    if not all_data:
+        return "_No subscription data available for managed identity analysis._"
+    
+    # Track managed identity counts by type and resource
+    identity_counts = {
+        "system_assigned": 0,
+        "user_assigned": 0,
+        "dual_mode": 0,  # Both system and user assigned
+        "total_resources": 0
+    }
+    
+    # Track which resource types use identities
+    resource_type_counts = {}
+    
+    for sub_id, data in all_data.items():
+        if "error" in data:
+            continue
+        
+        # Check for managed identities on common resource types
+        resource_types = [
+            "virtual_machines", "app_services", "function_apps", 
+            "logic_apps", "automation_accounts", "data_factories"
+        ]
+        
+        for resource_type in resource_types:
+            if resource_type not in data:
+                continue
+                
+            resources = data.get(resource_type, [])
+            for resource in resources:
+                if not isinstance(resource, dict):
+                    continue
+                
+                # Check for identity property
+                identity = resource.get("identity", {})
+                if not identity:
+                    continue
+                
+                identity_counts["total_resources"] += 1
+                
+                # Count by identity type
+                identity_type = identity.get("type", "").lower()
+                if identity_type == "systemassigned":
+                    identity_counts["system_assigned"] += 1
+                elif identity_type == "userassigned":
+                    identity_counts["user_assigned"] += 1
+                elif identity_type == "systemassigned,userassigned":
+                    identity_counts["dual_mode"] += 1
+                
+                # Track resource types
+                display_type = resource_type.replace("_", " ").title()
+                resource_type_counts[display_type] = resource_type_counts.get(display_type, 0) + 1
+    
+    total_identities = sum([identity_counts["system_assigned"], identity_counts["user_assigned"], identity_counts["dual_mode"]])
+    if total_identities == 0:
+        return "No managed identities detected in the environment"
+    
+    # Create summary
+    identity_summary = []
+    
+    # Overall usage
+    identity_summary.append(f"**{total_identities}** resources using managed identities")
+    
+    # Type breakdown
+    system_percentage = (identity_counts["system_assigned"] / total_identities) * 100
+    user_percentage = (identity_counts["user_assigned"] / total_identities) * 100
+    dual_percentage = (identity_counts["dual_mode"] / total_identities) * 100
+    
+    identity_summary.append(f"- **{system_percentage:.1f}%** using system-assigned identities")
+    identity_summary.append(f"- **{user_percentage:.1f}%** using user-assigned identities")
+    identity_summary.append(f"- **{dual_percentage:.1f}%** using both types")
+    
+    # Resource type usage
+    sorted_types = sorted(resource_type_counts.items(), key=lambda x: x[1], reverse=True)
+    if sorted_types:
+        type_list = [f"{name} ({count})" for name, count in sorted_types[:3]]
+        identity_summary.append(f"- **Common resources**: {', '.join(type_list)}")
+    
+    if identity_summary:
+        return "\n".join(identity_summary)
+    else:
+        return "_No clear managed identity usage patterns detected._"
+
+def _analyze_service_principals(all_data):
+    """Analyzes service principal usage patterns in the environment.
+    
+    Args:
+        all_data (dict): Dictionary of subscription data from fetchers.
+        
+    Returns:
+        str: Markdown-formatted summary of service principal usage.
+    """
+    if not all_data:
+        return "_No subscription data available for service principal analysis._"
+    
+    # Track service principal assignments and usage
+    sp_counts = {
+        "total": 0,
+        "with_roles": 0,
+        "per_subscription": {}
+    }
+    
+    # Track common roles assigned to service principals
+    sp_roles = {}
+    
+    for sub_id, data in all_data.items():
+        if "error" in data or "security" not in data:
+            continue
+        
+        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
+        sp_counts["per_subscription"][sub_name] = 0
+        
+        # Count service principals from role assignments
+        role_assignments = data["security"].get("role_assignments", [])
+        for assignment in role_assignments:
+            if not isinstance(assignment, dict):
+                continue
+            
+            principal_type = assignment.get("principal_type", "").lower()
+            if "service" in principal_type:
+                sp_counts["total"] += 1
+                sp_counts["with_roles"] += 1
+                sp_counts["per_subscription"][sub_name] += 1
+                
+                # Track roles assigned to service principals
+                role_name = assignment.get("role_definition_name", "Unknown")
+                if role_name != "Unknown":
+                    sp_roles[role_name] = sp_roles.get(role_name, 0) + 1
+    
+    if sp_counts["total"] == 0:
+        return "No service principals detected with role assignments"
+    
+    # Create summary
+    sp_summary = []
+    
+    # Overall count
+    sp_summary.append(f"**{sp_counts['total']}** service principals with Azure RBAC assignments")
+    
+    # Distribution across subscriptions
+    active_subs = sum(1 for count in sp_counts["per_subscription"].values() if count > 0)
+    total_subs = len(sp_counts["per_subscription"])
+    sp_summary.append(f"- Service principals active in **{active_subs}** of {total_subs} subscriptions")
+    
+    # Common roles
+    sorted_roles = sorted(sp_roles.items(), key=lambda x: x[1], reverse=True)
+    if sorted_roles:
+        role_list = [f"{role}" for role, count in sorted_roles[:3]]
+        sp_summary.append(f"- **Common roles**: {', '.join(role_list)}")
+    
+    if sp_summary:
+        return "\n".join(sp_summary)
+    else:
+        return "_No clear service principal usage patterns detected._"
+
+# --- Placeholder Content Helpers (Additional) ---
+
+def _get_service_endpoints_summary(all_data):
+    """Generates Markdown summary for configured service endpoints."""
+    service_endpoint_count = 0
+    total_subnets = 0
+    
+    for sub_id, data in all_data.items():
+        if "error" in data or "networking" not in data:
+            continue
+        
+        # Count service endpoints in subnets
+        subnets = data["networking"].get("subnets", [])
+        total_subnets += len(subnets)
+        for subnet in subnets:
+            if isinstance(subnet, dict) and subnet.get("service_endpoints"):
+                service_endpoint_count += 1
+    
+    if total_subnets == 0:
+        return "_No subnet data available to analyze service endpoints._"
+    
+    service_endpoint_percentage = (service_endpoint_count / total_subnets) * 100 if total_subnets > 0 else 0
+    
+    return f"Approximately {service_endpoint_percentage:.1f}% of subnets have service endpoints configured. Detailed subnet-level analysis requires additional inspection."
+
+def _get_private_link_services_table(all_data):
+    """Generates Markdown table for Private Link Services."""
+    headers = ["Subscription", "Name", "Location", "Load Balancer Frontend IP", "Visibility"]
+    rows = []
+    found_any = False
+    
+    for sub_id, data in all_data.items():
+        if "error" in data or "networking" not in data:
+            continue
+        
+        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
+        private_link_services = data["networking"].get("private_link_services", [])
+        
+        if private_link_services:
+            found_any = True
+            
+        for pls in private_link_services:
+            if isinstance(pls, dict):
+                # Extract frontend IP configurations if available
+                frontend_ips = "N/A"
+                if pls.get("frontend_ip_configurations"):
+                    frontend_ips = ", ".join([ip.get("name", "Unknown") for ip in pls.get("frontend_ip_configurations", [])])
+                
+                # Determine visibility
+                visibility = "Private"
+                if pls.get("visibility", {}).get("subscriptions"):
+                    visibility = f"Visible to {len(pls.get('visibility', {}).get('subscriptions', []))} subscription(s)"
+                elif pls.get("auto_approval", {}).get("subscriptions"):
+                    visibility = f"Auto-approved for {len(pls.get('auto_approval', {}).get('subscriptions', []))} subscription(s)"
+                
+                rows.append([
+                    sub_name,
+                    pls.get("name", "Unknown"),
+                    pls.get("location", "Unknown"),
+                    frontend_ips,
+                    visibility
+                ])
+    
+    if not found_any:
+        return "_No Private Link Services detected in the environment._"
+    
+    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
+
+def _get_serverless_summary(all_data):
+    """Generates summary of serverless components (Functions, Logic Apps, etc.)."""
+    serverless_components = {
+        "function_apps": 0,
+        "logic_apps": 0,
+        "event_grid_topics": 0,
+        "event_hubs": 0
+    }
+    
+    for sub_id, data in all_data.items():
+        if "error" in data:
+            continue
+        
+        resources = data.get("resources", [])
+        for res in resources:
+            if not isinstance(res, dict):
+                continue
+                
+            res_type = res.get("type", "").lower()
+            if "microsoft.web/sites" in res_type and "function" in res.get("kind", "").lower():
+                serverless_components["function_apps"] += 1
+            elif "microsoft.logic/workflows" in res_type:
+                serverless_components["logic_apps"] += 1
+            elif "microsoft.eventgrid/topics" in res_type:
+                serverless_components["event_grid_topics"] += 1
+            elif "microsoft.eventhub/namespaces" in res_type:
+                serverless_components["event_hubs"] += 1
+    
+    # Create summary text
+    summary_parts = []
+    for component, count in serverless_components.items():
+        if count > 0:
+            name = component.replace("_", " ").title()
+            summary_parts.append(f"**{name}**: {count}")
+    
+    if not summary_parts:
+        return "_No serverless components detected in the environment._"
+    
+    return "Detected serverless components: " + ", ".join(summary_parts)
+
+def _summarize_web_apps(all_data):
+    """Summarizes web application architectures based on App Services and other components."""
+    web_apps_count = 0
+    hosting_patterns = {
+        "windows": 0,
+        "linux": 0,
+        "container": 0,
+        "static": 0
+    }
+    
+    # Integration features
+    features = {
+        "vnet_integration": 0,
+        "cdn": 0,
+        "front_door": 0,
+        "app_gateway": 0
+    }
+    
+    for sub_id, data in all_data.items():
+        if "error" in data:
+            continue
+        
+        resources = data.get("resources", [])
+        for res in resources:
+            if not isinstance(res, dict):
+                continue
+                
+            # Count Web Apps
+            if res.get("type") == "Microsoft.Web/sites" and "functionapp" not in res.get("kind", "").lower():
+                web_apps_count += 1
+                
+                # Determine hosting type
+                kind = res.get("kind", "").lower()
+                if "linux" in kind:
+                    hosting_patterns["linux"] += 1
+                elif "container" in kind:
+                    hosting_patterns["container"] += 1
+                elif "staticapp" in kind:
+                    hosting_patterns["static"] += 1
+                else:
+                    hosting_patterns["windows"] += 1  # Default is Windows
+                
+                # Check for VNet integration
+                properties = res.get("properties", {})
+                if properties.get("virtualNetworkSubnetId") or "WEBSITE_VNET_ROUTE_ALL" in str(properties):
+                    features["vnet_integration"] += 1
+            
+            # Check for CDN profiles that might be used with web apps
+            elif "microsoft.cdn/profiles" in res.get("type", "").lower():
+                features["cdn"] += 1
+            
+            # Check for Front Door profiles
+            elif "microsoft.network/frontdoors" in res.get("type", "").lower():
+                features["front_door"] += 1
+            
+            # Check for App Gateways
+            elif "microsoft.network/applicationgateways" in res.get("type", "").lower():
+                features["app_gateway"] += 1
+    
+    if web_apps_count == 0:
+        return "_No web applications detected in the environment._"
+    
+    # Create summary text
+    platform_summary = []
+    for platform, count in hosting_patterns.items():
+        if count > 0:
+            percentage = (count / web_apps_count) * 100
+            platform_summary.append(f"{platform.title()} ({percentage:.1f}%)")
+    
+    feature_summary = []
+    for feature, count in features.items():
+        if count > 0:
+            feature_name = feature.replace("_", " ").title()
+            feature_summary.append(f"{feature_name} ({count})")
+    
+    summary = f"**{web_apps_count}** web application(s) detected.\n"
+    summary += f"- **Platforms**: {', '.join(platform_summary)}\n"
+    if feature_summary:
+        summary += f"- **Common features**: {', '.join(feature_summary)}"
+    
+    return summary
+
+def _summarize_api_services(all_data):
+    """Summarizes API Services (API Management, Functions, App Service APIs)."""
+    api_components = {
+        "api_management": 0,
+        "api_apps": 0,
+        "function_api": 0
+    }
+    
+    apim_details = []
+    
+    for sub_id, data in all_data.items():
+        if "error" in data:
+            continue
+        
+        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
+        resources = data.get("resources", [])
+        
+        for res in resources:
+            if not isinstance(res, dict):
+                continue
+                
+            res_type = res.get("type", "").lower()
+            
+            # Check for API Management
+            if "microsoft.apimanagement/service" in res_type:
+                api_components["api_management"] += 1
+                sku = res.get("sku", {}).get("name", "Unknown")
+                apim_details.append(f"**{res.get('name', 'Unknown')}** ({sub_name}, SKU: {sku})")
+            
+            # Check for API Apps
+            elif "microsoft.web/sites" in res_type:
+                kind = res.get("kind", "").lower()
+                if "api" in kind:
+                    api_components["api_apps"] += 1
+                elif "function" in kind:
+                    # Functions are often used as APIs
+                    api_components["function_api"] += 1
+    
+    # Create summary
+    if sum(api_components.values()) == 0:
+        return "_No dedicated API services detected in the environment._"
+    
+    summary = []
+    
+    if api_components["api_management"] > 0:
+        summary.append(f"**API Management**: {api_components['api_management']} instance(s)")
+        if apim_details:
+            summary.append("  - " + "\n  - ".join(apim_details[:3]))
+            if len(apim_details) > 3:
+                summary.append(f"  - ... and {len(apim_details) - 3} more")
+    
+    if api_components["api_apps"] > 0:
+        summary.append(f"**API Apps**: {api_components['api_apps']} app(s)")
+    
+    if api_components["function_api"] > 0:
+        summary.append(f"**Function APIs**: {api_components['function_api']} function app(s) (potential APIs)")
+    
+    return "\n".join(summary)
+
+def _summarize_container_services(all_data):
+    """Summarizes container services (AKS, ACI, App Service containers)."""
+    container_services = {
+        "aks": 0,
+        "container_instances": 0,
+        "app_service_containers": 0
+    }
+    
+    aks_details = []
+    
+    for sub_id, data in all_data.items():
+        if "error" in data:
+            continue
+        
+        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
+        resources = data.get("resources", [])
+        
+        for res in resources:
+            if not isinstance(res, dict):
+                continue
+                
+            res_type = res.get("type", "").lower()
+            
+            # Check for AKS clusters
+            if "microsoft.containerservice/managedclusters" in res_type:
+                container_services["aks"] += 1
+                aks_details.append(f"**{res.get('name', 'Unknown')}** ({sub_name}, {res.get('location', 'Unknown')})")
+            
+            # Check for Container Instances
+            elif "microsoft.containerinstance/containergroups" in res_type:
+                container_services["container_instances"] += 1
+            
+            # Check for App Service containers
+            elif "microsoft.web/sites" in res_type:
+                kind = res.get("kind", "").lower()
+                if "container" in kind:
+                    container_services["app_service_containers"] += 1
+    
+    # Create summary
+    if sum(container_services.values()) == 0:
+        return "_No container services detected in the environment._"
+    
+    summary = []
+    
+    if container_services["aks"] > 0:
+        summary.append(f"**AKS Clusters**: {container_services['aks']} cluster(s)")
+        if aks_details:
+            summary.append("  - " + "\n  - ".join(aks_details[:3]))
+            if len(aks_details) > 3:
+                summary.append(f"  - ... and {len(aks_details) - 3} more")
+    
+    if container_services["container_instances"] > 0:
+        summary.append(f"**Container Instances**: {container_services['container_instances']} group(s)")
+    
+    if container_services["app_service_containers"] > 0:
+        summary.append(f"**App Service Containers**: {container_services['app_service_containers']} app(s)")
+    
+    return "\n".join(summary)
+
+def _get_autoscaling_summary(all_data):
+    """Generates a summary of autoscaling configurations."""
+    autoscale_counts = {
+        "vm_scale_sets": 0,
+        "app_service_plans": 0,
+        "kubernetes": 0
+    }
+    
+    # Track autoscale settings
+    settings_count = 0
+    
+    for sub_id, data in all_data.items():
+        if "error" in data:
+            continue
+        
+        resources = data.get("resources", [])
+        for res in resources:
+            if not isinstance(res, dict):
+                continue
+                
+            res_type = res.get("type", "").lower()
+            
+            # Count VM Scale Sets
+            if "microsoft.compute/virtualmachinescalesets" in res_type:
+                autoscale_counts["vm_scale_sets"] += 1
+            
+            # App Service Plans with autoscale
+            elif "microsoft.web/serverfarms" in res_type:
+                sku = res.get("sku", {}).get("tier", "").lower()
+                # Only Standard and Premium tiers support autoscale
+                if sku in ["standard", "premium", "premiumv2", "premiumv3", "isolated"]:
+                    autoscale_counts["app_service_plans"] += 1
+            
+            # Kubernetes (AKS) with autoscaler
+            elif "microsoft.containerservice/managedclusters" in res_type:
+                properties = res.get("properties", {})
+                if properties.get("agentPoolProfiles"):
+                    for pool in properties.get("agentPoolProfiles", []):
+                        if isinstance(pool, dict) and pool.get("enableAutoScaling", False):
+                            autoscale_counts["kubernetes"] += 1
+                            break
+        
+        # Check for autoscale settings from the scaling fetcher if available
+        if "scaling" in data:
+            autoscale_settings = data["scaling"].get("autoscale_settings", [])
+            settings_count += len(autoscale_settings)
+    
+    # Create summary
+    if sum(autoscale_counts.values()) == 0 and settings_count == 0:
+        return "_No autoscaling configurations detected in the environment._"
+    
+    summary = []
+    
+    if settings_count > 0:
+        summary.append(f"**{settings_count}** autoscale setting(s) configured")
+    
+    for resource_type, count in autoscale_counts.items():
+        if count > 0:
+            name = resource_type.replace("_", " ").title()
+            summary.append(f"**{name}**: {count} resource(s) potentially using autoscale")
+    
+    return "\n".join(summary)
+
+def _get_availability_summary(all_data):
+    """Analyzes resource availability patterns (Availability Sets, Zones)."""
+    # Initialize counters for various availability features
+    availability_counts = {
+        "vms_in_availability_sets": 0,
+        "vms_in_availability_zones": 0,
+        "zonal_storage_accounts": 0,
+        "zonal_mysql": 0,
+        "zonal_postgres": 0,
+        "zonal_sql": 0,
+        "zonal_aks": 0,
+        "total_vms": 0
+    }
+    
+    # Count resource groups with "dr" in name (potential DR resources)
+    dr_resource_groups = set()
+    
+    for sub_id, data in all_data.items():
+        if "error" in data:
+            continue
+        
+        # Check for VM availability features from compute data
+        compute_data = data.get("compute", [])
+        if compute_data:
+            availability_counts["total_vms"] += len(compute_data)
+            
+            for vm in compute_data:
+                if isinstance(vm, dict):
+                    # Check for availability zones
+                    if vm.get("zones"):
+                        availability_counts["vms_in_availability_zones"] += 1
+                    
+                    # Check for availability set
+                    if vm.get("availability_set_id"):
+                        availability_counts["vms_in_availability_sets"] += 1
+        
+        # If no compute data is available, check resources
+        resources = data.get("resources", [])
+        
+        # Count VMs, fallback if compute fetcher not used
+        if not compute_data:
+            vms = [r for r in resources if isinstance(r, dict) and r.get("type") == "Microsoft.Compute/virtualMachines"]
+            availability_counts["total_vms"] += len(vms)
+        
+        # Check for zonal/replicated resources
+        for res in resources:
+            if not isinstance(res, dict):
+                continue
+                
+            res_type = res.get("type", "").lower()
+            
+            # Check for ZRS storage accounts
+            if "microsoft.storage/storageaccounts" in res_type:
+                sku = res.get("sku", {}).get("name", "").lower()
+                if "zrs" in sku:
+                    availability_counts["zonal_storage_accounts"] += 1
+            
+            # Check for zonal databases
+            elif "microsoft.dbformysql/servers" in res_type:
+                sku = res.get("sku", {}).get("tier", "").lower()
+                if "zoneredundant" in sku or "memory" in sku:  # Memory Optimized often uses zones
+                    availability_counts["zonal_mysql"] += 1
+            
+            elif "microsoft.dbforpostgresql/servers" in res_type:
+                sku = res.get("sku", {}).get("tier", "").lower()
+                if "zoneredundant" in sku or "memory" in sku:
+                    availability_counts["zonal_postgres"] += 1
+            
+            elif "microsoft.sql/servers/databases" in res_type:
+                sku = res.get("sku", {}).get("name", "").lower()
+                # Premium and Business Critical tiers are zone redundant
+                if "premium" in sku or "business" in sku or "critical" in sku:
+                    availability_counts["zonal_sql"] += 1
+            
+            # Check for zonal AKS clusters
+            elif "microsoft.containerservice/managedclusters" in res_type:
+                if res.get("zones"):
+                    availability_counts["zonal_aks"] += 1
+        
+        # Check for potential DR resource groups
+        resource_groups = data.get("resource_groups", [])
+        for rg in resource_groups:
+            if isinstance(rg, dict) and rg.get("name"):
+                rg_name = rg.get("name", "").lower()
+                if "dr" in rg_name.split("-") or "disaster" in rg_name or "recovery" in rg_name:
+                    dr_resource_groups.add(f"{rg.get('name')} (Sub: {data.get('subscription_info', {}).get('display_name', sub_id)})")
+    
+    # Create summary based on findings
+    summary = []
+    
+    # VM availability analysis
+    if availability_counts["total_vms"] > 0:
+        vm_as_percentage = (availability_counts["vms_in_availability_sets"] / availability_counts["total_vms"]) * 100 if availability_counts["total_vms"] > 0 else 0
+        vm_az_percentage = (availability_counts["vms_in_availability_zones"] / availability_counts["total_vms"]) * 100 if availability_counts["total_vms"] > 0 else 0
+        
+        summary.append(f"**Virtual Machines** ({availability_counts['total_vms']} total):")
+        summary.append(f"- {vm_as_percentage:.1f}% in Availability Sets")
+        summary.append(f"- {vm_az_percentage:.1f}% in Availability Zones")
+    
+    # Database availability
+    db_summary = []
+    if availability_counts["zonal_sql"] > 0:
+        db_summary.append(f"{availability_counts['zonal_sql']} SQL Databases with zone redundancy")
+    if availability_counts["zonal_mysql"] > 0:
+        db_summary.append(f"{availability_counts['zonal_mysql']} MySQL Databases with zone redundancy")
+    if availability_counts["zonal_postgres"] > 0:
+        db_summary.append(f"{availability_counts['zonal_postgres']} PostgreSQL Databases with zone redundancy")
+    
+    if db_summary:
+        summary.append("**Databases**:")
+        for item in db_summary:
+            summary.append(f"- {item}")
+    
+    # Storage availability
+    if availability_counts["zonal_storage_accounts"] > 0:
+        summary.append(f"**Storage**: {availability_counts['zonal_storage_accounts']} Storage Account(s) with ZRS/GZRS redundancy")
+    
+    # AKS zone redundancy
+    if availability_counts["zonal_aks"] > 0:
+        summary.append(f"**Kubernetes**: {availability_counts['zonal_aks']} AKS cluster(s) with zone redundancy")
+    
+    # DR resource groups
+    if dr_resource_groups:
+        summary.append("**Potential DR Resources**:")
+        for rg in list(dr_resource_groups)[:3]:
+            summary.append(f"- {rg}")
+        if len(dr_resource_groups) > 3:
+            summary.append(f"- ... and {len(dr_resource_groups) - 3} more")
+    
+    if not summary:
+        return "_No clear availability patterns detected in the environment._"
+    
+    return "\n".join(summary)
+
+def _get_load_balancing_summary(all_data):
+    """Generates summary of load balancing resources."""
+    # Initialize counters for load balancing resources
+    lb_counts = {
+        "load_balancers": 0,
+        "application_gateways": 0,
+        "front_doors": 0,
+        "traffic_managers": 0
+    }
+    
+    # Details for important load balancers
+    lb_details = []
+    appgw_details = []
+    
+    for sub_id, data in all_data.items():
+        if "error" in data:
+            continue
+        
+        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
+        resources = data.get("resources", [])
+        networking = data.get("networking", {})
+        
+        # Check for load balancers in networking data
+        if "load_balancers" in networking:
+            load_balancers = networking.get("load_balancers", [])
+            lb_counts["load_balancers"] += len(load_balancers)
+            
+            # Collect details for major load balancers
+            for lb in load_balancers:
+                if isinstance(lb, dict):
+                    sku = lb.get("sku", {}).get("name", "Basic")
+                    if sku.lower() == "standard":
+                        backend_pools = len(lb.get("backend_address_pools", []))
+                        lb_details.append(f"**{lb.get('name', 'Unknown')}** (Sub: {sub_name}, {backend_pools} backend pools)")
+        
+        # Check for App Gateways in networking data
+        if "app_gateways" in networking:
+            app_gateways = networking.get("app_gateways", [])
+            lb_counts["application_gateways"] += len(app_gateways)
+            
+            # Collect details for App Gateways
+            for gw in app_gateways:
+                if isinstance(gw, dict):
+                    sku = gw.get("sku", {}).get("name", "Standard")
+                    tier = gw.get("sku", {}).get("tier", "Standard")
+                    appgw_details.append(f"**{gw.get('name', 'Unknown')}** (Sub: {sub_name}, {tier} {sku})")
+        
+        # Fall back to resource checks if networking data is limited
+        for res in resources:
+            if not isinstance(res, dict):
+                continue
+                
+            res_type = res.get("type", "").lower()
+            
+            # Check if we've already counted these from networking data
+            if "load_balancers" not in networking and "microsoft.network/loadbalancers" in res_type:
+                lb_counts["load_balancers"] += 1
+            
+            if "app_gateways" not in networking and "microsoft.network/applicationgateways" in res_type:
+                lb_counts["application_gateways"] += 1
+            
+            # Check for Front Door instances
+            if "microsoft.network/frontdoors" in res_type or "microsoft.cdn/profiles" in res_type and "frontdoor" in res.get("sku", {}).get("name", "").lower():
+                lb_counts["front_doors"] += 1
+            
+            # Check for Traffic Manager profiles
+            if "microsoft.network/trafficmanagerprofiles" in res_type:
+                lb_counts["traffic_managers"] += 1
+    
+    # Create summary based on findings
+    if sum(lb_counts.values()) == 0:
+        return "_No load balancing resources detected in the environment._"
+    
+    summary = []
+    
+    # Overall stats
+    summary.append(f"**Load Balancing Resources**:")
+    for lb_type, count in lb_counts.items():
+        if count > 0:
+            name = lb_type.replace("_", " ").title()
+            summary.append(f"- {name}: {count}")
+    
+    # Multi-region traffic management
+    if lb_counts["front_doors"] > 0 or lb_counts["traffic_managers"] > 0:
+        multi_region = []
+        if lb_counts["front_doors"] > 0:
+            multi_region.append(f"Azure Front Door ({lb_counts['front_doors']})")
+        if lb_counts["traffic_managers"] > 0:
+            multi_region.append(f"Traffic Manager ({lb_counts['traffic_managers']})")
+        
+        summary.append(f"**Multi-Region Traffic Management**: {', '.join(multi_region)}")
+    
+    # Application Delivery details
+    if appgw_details:
+        summary.append("**Application Delivery**:")
+        for detail in appgw_details[:3]:
+            summary.append(f"- {detail}")
+        if len(appgw_details) > 3:
+            summary.append(f"- ... and {len(appgw_details) - 3} more")
+    
+    # Network Load Balancer details
+    if lb_details:
+        summary.append("**Network Load Balancers**:")
+        for detail in lb_details[:3]:
+            summary.append(f"- {detail}")
+        if len(lb_details) > 3:
+            summary.append(f"- ... and {len(lb_details) - 3} more")
+    
+    return "\n".join(summary)
+
+# --- Main Function ---
+
+def generate_design_document(subscription_data, output_dir, tenant_name, tenant_domain, version, management_group_data=None, diagram_paths=None, timestamp_str=None, silent_mode=False):
+    """Generates a comprehensive design document."""
+    
+    if not subscription_data:
+        logging.error("No subscription data provided")
+        return None
+
+    try:
+        # Initialize sections list
+        doc_sections = []
+
+        # Add Executive Summary
+        doc_sections.append({
+            "title": "Executive Summary",
+            "content": f"""
+# Azure Environment Design Document
+Version: {version}
+Generated: {timestamp_str if timestamp_str else datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## Overview
+This document provides a comprehensive overview of the Azure environment for tenant "{tenant_name}" ({tenant_domain}).
+"""
+        })
+
+        # Add Subscription Overview
+        doc_sections.append({
+            "title": "Subscription Overview",
+            "content": _get_subscriptions_table(subscription_data)
+        })
+
+        # Add Management Groups section if data available
+        doc_sections.append({
+            "title": "Management Groups",
+            "content": _get_management_group_hierarchy_summary(management_group_data) if management_group_data else "_No management group data available._"
+        })
+
+        # Add Resource Organization
+        doc_sections.append({
+            "title": "Resource Organization",
+            "content": _analyze_rg_naming_patterns(subscription_data)
+        })
+
+        # Add Network Architecture
+        doc_sections.append({
+            "title": "Network Architecture",
+            "content": _analyze_network_topology(subscription_data)
+        })
+
+        # Add Identity & Access Management
+        doc_sections.append({
+            "title": "Identity & Access Management",
+            "content": _analyze_rbac_approach(subscription_data)
+        })
+
+        # Add Data Platform
+        doc_sections.append({
+            "title": "Data Platform",
+            "content": _get_data_platform_section(subscription_data)
+        })
+
+        # Add AI & Machine Learning Services
+        ai_services_content = []
+        ai_services_content.append("""
+This section provides an overview of Azure AI and Machine Learning services deployed across the environment.
+
+#### Overview
+The following subsections detail the AI and Machine Learning services currently deployed, their configurations, and associated resources.
+""")
+
+        # Process each subscription's AI services
+        for sub_id, data in subscription_data.items():
+            if isinstance(data, dict) and "error" not in data:
+                ai_summary = _get_ai_services_summary(data)
+                if ai_summary and ai_summary != "_No AI services found in this subscription._":
+                    ai_services_content.append(f"\n### Subscription: {sub_id}\n")
+                    ai_services_content.append(ai_summary)
+
+        if len(ai_services_content) == 1:  # Only has the overview text
+            ai_services_content.append("\n_No AI services found across any subscriptions._")
+
+        doc_sections.append({
+            "title": "AI & Machine Learning Services",
+            "content": "\n".join(ai_services_content)
+        })
+
+        # Add Security & Compliance
+        doc_sections.append({
+            "title": "Security & Compliance",
+            "content": _get_security_section(subscription_data)
+        })
+
+        # Add Cost Analysis
+        doc_sections.append({
+            "title": "Cost Analysis",
+            "content": _get_subscription_costs_table(subscription_data) + "\n\n" + _get_cost_optimization_summary(subscription_data)
+        })
+
+        # Add Network Diagrams if available
+        if diagram_paths:
+            doc_sections.append({
+                "title": "Network Diagrams",
+                "content": _get_subscription_diagram_links(subscription_data, diagram_paths, output_dir)
+            })
+
+        # Generate the markdown content
+        markdown_content = []
+        for section in doc_sections:
+            # Add section title
+            markdown_content.append(f"## {section['title']}\n")
+            # Add section content, ensuring it's a string
+            content = section.get('content', '')
+            if not isinstance(content, str):
+                logging.warning(f"Non-string content found in section {section['title']}, converting to string")
+                content = str(content)
+            markdown_content.append(content)
+            markdown_content.append("\n\n")  # Add spacing between sections
+
+        # Write to file
+        os.makedirs(output_dir, exist_ok=True)
+        output_file = os.path.join(output_dir, f"design_document_{timestamp_str}.md")
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write("\n".join(markdown_content))
+        
+        logging.info(f"Design document generated: {output_file}")
+        return output_file
+
+    except Exception as e:
+        logging.error(f"Failed to generate design document: {str(e)}")
+        import traceback
+        logging.error(f"Traceback: {traceback.format_exc()}")
+        return None
+
+# --- (Existing Data Aggregation & Analysis Helpers below this point remain unchanged) ---
+
+# --- Data Aggregation & Analysis Helpers ---
+# (These functions process the raw data into summaries/tables for the placeholders)
+
+# Example: (Keep existing helper functions like _get_storage_accounts_table etc.)
+
+# ... existing code ...
+
+def _get_storage_accounts_table(all_data):
+    """Generates Markdown table for Storage Accounts."""
+    headers = ["Subscription", "Name", "SKU", "Access Tier", "Location", "Security"]
+    rows = []
+    found_any = False
+
+    for sub_id, data in all_data.items():
+        if "error" in data:
+            continue
+            
+        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
+        storage_data = data.get("storage", {})
+        
+        if not isinstance(storage_data, dict):
+            continue
+            
+        for account in storage_data.get("storage_accounts", []):
+            found_any = True
+            
+            # Get SKU details
+            sku = account.get("sku", {})
+            sku_name = sku.get("name", "Unknown")
+            sku_tier = sku.get("tier", "Standard")
+            
+            # Build security features list
+            security_features = []
+            if account.get("enable_https_traffic_only"):
+                security_features.append("HTTPS")
+            if account.get("encryption", {}).get("key_source") == "Microsoft.Keyvault":
+                security_features.append("CMK")
+            
+            # Check network rules
+            network_rules = account.get("network_rule_set", {})
+            if network_rules.get("default_action") == "Deny":
+                security_features.append("Firewall")
+            if network_rules.get("virtual_network_rules"):
+                security_features.append("VNet")
+            
+            # Check private endpoints
+            if account.get("private_endpoint_connections"):
+                security_features.append("PE")
+                
+            # Check soft delete settings
+            blob_props = account.get("blob_service_properties", {})
+            if blob_props.get("delete_retention_policy", {}).get("enabled"):
+                days = blob_props.get("delete_retention_policy", {}).get("days")
+                security_features.append(f"Soft-Delete({days}d)")
+            
+            rows.append([
+                sub_name,
+                account.get("name", "Unknown"),
+                f"{sku_tier} ({sku_name})",
+                account.get("access_tier", "Unknown"),
+                account.get("location", "Unknown"),
+                ", ".join(security_features) if security_features else "Basic"
+            ])
+
+    if not found_any:
+        return "_No Storage Accounts detected in the environment._"
+        
+    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
+
+def _get_data_lake_analysis(all_data):
+    """Analyzes usage of Azure Data Lake Storage (ADLS Gen2)."""
+    adls_count = 0
+    for sub_id, data in all_data.items():
+        if "error" in data or "resources" not in data: continue
+        resources = data.get("resources", [])
+        for res in resources:
+            if isinstance(res, dict) and res.get("type", "").lower() == "microsoft.storage/storageaccounts":
+                properties = res.get("properties", {})
+                if properties.get("isHnsEnabled", False): # Key indicator for ADLS Gen2
+                    adls_count += 1
+                    
+    if adls_count > 0:
+        return f"Detected **{adls_count}** Storage Account(s) configured as Azure Data Lake Storage Gen2 (Hierarchical Namespace Enabled)."
+    else:
+        return "_No Azure Data Lake Storage Gen2 usage detected (based on Hierarchical Namespace status)._"
+
+def _get_backup_storage_analysis(all_data):
+    """Analyzes storage used by Azure Backup (Recovery Services Vaults)."""
+    # Re-use the redundancy summary logic from monitoring section
+    return _get_backup_redundancy_summary(all_data) or "_Backup storage analysis unavailable._"
+
+def _get_databases_table(all_data, db_type="all"):
+    """Generates Markdown table for databases (SQL DB, MySQL, PostgreSQL, Cosmos DB)."""
+    headers = ["Subscription", "Name", "Type", "SKU/Tier", "Location", "Status"]
+    rows = []
+    found_any = False
+
+    for sub_id, data in all_data.items():
+        if "error" in data:
+            continue
+        
+        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
+        
+        # Use the new database fetcher data
+        db_data = data.get("database", {})
+        if not isinstance(db_data, dict):
+            continue
+
+        # SQL Databases
+        for server in db_data.get("sql_servers", []):
+            server_name = server.get("name", "Unknown")
+            for db in db_data.get("sql_databases", []):
+                if db.get("server_name") == server_name:
+                    found_any = True
+                    is_relational = True
+                    sku = db.get("sku", {})
+                    sku_name = sku.get("name", "Unknown")
+                    tier = sku.get("tier", "Unknown")
+                    rows.append([
+                        sub_name,
+                        f"{server_name}/{db.get('name', 'Unknown')}",
+                        "Azure SQL Database",
+                        f"{tier} ({sku_name})",
+                        db.get("location", "Unknown"),
+                        db.get("status", "Unknown")
+                    ])
+
+        # SQL Elastic Pools
+        for pool in db_data.get("sql_elastic_pools", []):
+            found_any = True
+            is_relational = True
+            sku = pool.get("sku", {})
+            rows.append([
+                sub_name,
+                f"{pool.get('server_name', 'Unknown')}/{pool.get('name', 'Unknown')}",
+                "SQL Elastic Pool",
+                f"{sku.get('tier', 'Unknown')} ({sku.get('name', 'Unknown')})",
+                pool.get("location", "Unknown"),
+                pool.get("state", "Unknown")
+            ])
+
+        # Cosmos DB
+        for account in db_data.get("cosmos_accounts", []):
+            found_any = True
+            is_nosql = True
+            consistency = account.get("consistency_policy", {}).get("default_consistency_level", "Unknown")
+            locations = len(account.get("write_locations", [])) + len(account.get("read_locations", []))
+            
+            # Add the account itself
+            rows.append([
+                sub_name,
+                account.get("name", "Unknown"),
+                f"Cosmos DB Account ({account.get('kind', 'Unknown')})",
+                f"Multi-region: {locations} regions",
+                account.get("location", "Unknown"),
+                f"Consistency: {consistency}"
+            ])
+            
+            # Add each database under the account
+            for db in db_data.get("cosmos_databases", []):
+                if db.get("account_name") == account.get("name"):
+                    throughput = db.get("throughput", "Unknown RU/s")
+                    if db.get("auto_scale_settings"):
+                        max_throughput = db.get("auto_scale_settings", {}).get("max_throughput", "Unknown")
+                        throughput = f"Autoscale (max: {max_throughput} RU/s)"
+                    
+                    rows.append([
+                        sub_name,
+                        f"{account.get('name', 'Unknown')}/{db.get('name', 'Unknown')}",
+                        "Cosmos DB Database",
+                        throughput,
+                        db.get("location", "Unknown"),
+                        "Active"  # Cosmos DB databases are always active if visible
+                    ])
+    
+    if not found_any or not rows:
+        return f"_No {db_type.replace('all','').capitalize()} databases detected in the environment._"
+    
+    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1], x[2])))
+
+def _get_analytics_services_table(all_data):
+    """Generates Markdown table for common Analytics Services (Synapse, Data Factory, Databricks)."""
+    headers = ["Subscription", "Name", "Type", "Location"]
+    rows = []
+    found_any = False
+    
+    for sub_id, data in all_data.items():
+        if "error" in data:
+            continue
+        
         sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
         resources = data.get("resources", [])
         
         for res in resources:
             if not isinstance(res, dict): continue
             res_type = res.get("type", "").lower()
+            service_type = None
             
-            # Check if it's one of our analytics services
-            for service_type, service_name in analytics_types.items():
-                if res_type == service_type.lower():
-                    name = res.get("name", "Unknown")
-                    location = res.get("location", "Unknown")
-                    
-                    # Extract subtypes for certain services
-                    subtype = ""
-                    if service_type == "microsoft.hdinsight/clusters":
-                        properties = res.get("properties", {})
-                        cluster_definition = properties.get("clusterDefinition", {})
-                        kind = cluster_definition.get("kind", "") if isinstance(cluster_definition, dict) else ""
-                        subtype = kind.capitalize() if kind else "Unknown"
-                    
-                    rows.append([
-                        sub_name,
-                        service_name,
-                        name,
-                        subtype,
-                        location
-                    ])
+            if "microsoft.synapse/workspaces" in res_type:
+                service_type = "Synapse Analytics Workspace"
+            elif "microsoft.datafactory/factories" in res_type:
+                service_type = "Data Factory"
+            elif "microsoft.databricks/workspaces" in res_type:
+                service_type = "Databricks Workspace"
+            
+            if service_type:
+                found_any = True
+                rows.append([
+                    sub_name,
+                    res.get("name", "Unknown"),
+                    service_type,
+                    res.get("location", "Unknown")
+                ])
     
-    if not rows:
-        return "_No Analytics services detected in the environment._"
-    
-    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1], x[2])))
+    if not found_any:
+        return "_No common Azure Analytics services detected (Synapse, Data Factory, Databricks)._"
+        
+    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
 
 def _get_encryption_strategy_summary(all_data):
-    """Analyzes encryption settings across resources."""
-    encryption_findings = []
-    
-    # Track encryption capabilities
-    storage_encryption = {"total": 0, "encrypted": 0}
-    sql_encryption = {"total": 0, "transparent_data_encryption": 0}
-    cosmos_encryption = {"total": 0, "encrypted": 0}
-    key_vault_protection = {"hsm": 0, "software": 0, "total": 0}
-    disk_encryption = {"total": 0, "encrypted": 0}
+    """Summarizes data encryption status based on common services."""
+    summary_points = [] 
+    checked_resources = {"storage": 0, "sql": 0, "kv": 0, "disk": 0}
+    encrypted_resources = {"storage_https": 0, "sql_tde": 0, "kv_soft_delete": 0, "disk_ade_sse_cmk": 0}
     
     for sub_id, data in all_data.items():
         if "error" in data: continue
         resources = data.get("resources", [])
-        
         for res in resources:
             if not isinstance(res, dict): continue
             res_type = res.get("type", "").lower()
             properties = res.get("properties", {})
             
-            # Check Storage Account encryption
-            if res_type == "microsoft.storage/storageaccounts":
-                storage_encryption["total"] += 1
-                encryption = properties.get("encryption", {})
-                if isinstance(encryption, dict) and encryption.get("services", {}).get("blob", {}).get("enabled", False):
-                    storage_encryption["encrypted"] += 1
-            
-            # Check SQL Server encryption
-            elif res_type == "microsoft.sql/servers/databases":
-                sql_encryption["total"] += 1
-                tde_status = properties.get("transparentDataEncryption", {})
-                if isinstance(tde_status, dict) and tde_status.get("status") == "Enabled":
-                    sql_encryption["transparent_data_encryption"] += 1
-            
-            # Check Cosmos DB encryption
-            elif res_type == "microsoft.documentdb/databaseaccounts":
-                cosmos_encryption["total"] += 1
-                # Cosmos DB is encrypted by default
-                cosmos_encryption["encrypted"] += 1
-            
-            # Check Key Vault protection type
-            elif res_type == "microsoft.keyvault/vaults":
-                key_vault_protection["total"] += 1
-                sku = res.get("sku", {})
-                if isinstance(sku, dict) and sku.get("name") == "premium":
-                    key_vault_protection["hsm"] += 1
-                else:
-                    key_vault_protection["software"] += 1
-            
-            # Check disk encryption
-            elif res_type == "microsoft.compute/disks":
-                disk_encryption["total"] += 1
-                if properties.get("encryption", {}).get("type") == "EncryptionAtRestWithCustomerKey":
-                    disk_encryption["encrypted"] += 1
-                # Azure managed disks are encrypted by default, but we're looking for custom key encryption here
+            # Storage Accounts
+            if "microsoft.storage/storageaccounts" in res_type:
+                checked_resources["storage"] += 1
+                if properties.get("supportsHttpsTrafficOnly", False):
+                    encrypted_resources["storage_https"] += 1
+                    
+            # SQL Databases (TDE is default, check for explicit disable is complex)
+            elif "microsoft.sql/servers/databases" in res_type:
+                 checked_resources["sql"] += 1
+                 # Assume TDE enabled unless evidence otherwise (hard to check)
+                 encrypted_resources["sql_tde"] += 1 
+                 
+            # Key Vaults (Soft delete implies some level of protection)
+            elif "microsoft.keyvault/vaults" in res_type:
+                 checked_resources["kv"] += 1
+                 if properties.get("enableSoftDelete", False):
+                     encrypted_resources["kv_soft_delete"] += 1
+                     
+            # Managed Disks (Check encryption settings)
+            elif "microsoft.compute/disks" in res_type:
+                 checked_resources["disk"] += 1
+                 encryption = properties.get("encryption", {})
+                 # SSE with PMK is default, check for ADE or CMK
+                 if encryption.get("type") in ["EncryptionAtRestWithPlatformKey", "EncryptionAtRestWithCustomerKey", "AzureDiskEncryption"]:
+                     encrypted_resources["disk_ade_sse_cmk"] += 1
+                     
+    # Generate Summary
+    if checked_resources["storage"] > 0:
+        https_perc = (encrypted_resources["storage_https"] / checked_resources["storage"]) * 100 if checked_resources["storage"] > 0 else 0
+        summary_points.append(f"- **Storage Accounts**: HTTPS traffic required on {https_perc:.1f}% (transit)")
     
-    # Build the summary
-    if (storage_encryption["total"] + sql_encryption["total"] + cosmos_encryption["total"] + 
-        key_vault_protection["total"] + disk_encryption["total"]) == 0:
-        return "_No resources found that would indicate encryption configuration._"
-    
-    # Storage Account encryption
-    if storage_encryption["total"] > 0:
-        percentage = (storage_encryption["encrypted"] / storage_encryption["total"]) * 100
-        encryption_findings.append(f"**Storage Accounts:** {storage_encryption['encrypted']}/{storage_encryption['total']} ({percentage:.0f}%) have encryption enabled")
-    
-    # SQL encryption
-    if sql_encryption["total"] > 0:
-        percentage = (sql_encryption["transparent_data_encryption"] / sql_encryption["total"]) * 100
-        encryption_findings.append(f"**SQL Databases:** {sql_encryption['transparent_data_encryption']}/{sql_encryption['total']} ({percentage:.0f}%) have Transparent Data Encryption (TDE) enabled")
-    
-    # Cosmos DB encryption
-    if cosmos_encryption["total"] > 0:
-        encryption_findings.append(f"**Cosmos DB:** All {cosmos_encryption['total']} instances use encryption-at-rest by default")
-    
-    # Key Vault protection
-    if key_vault_protection["total"] > 0:
-        hsm_percentage = (key_vault_protection["hsm"] / key_vault_protection["total"]) * 100
-        encryption_findings.append(f"**Key Vaults:** {key_vault_protection['hsm']}/{key_vault_protection['total']} ({hsm_percentage:.0f}%) use HSM-protected keys (Premium tier)")
-    
-    # Disk encryption
-    if disk_encryption["total"] > 0:
-        percentage = (disk_encryption["encrypted"] / disk_encryption["total"]) * 100
-        encryption_findings.append(f"**Azure Disks:** {disk_encryption['encrypted']}/{disk_encryption['total']} ({percentage:.0f}%) use customer-managed keys for encryption")
-    
-    return "\n".join(encryption_findings)
-
-def _get_backup_storage_analysis(all_data):
-    """Analyzes backup storage usage across resources."""
-    backup_findings = []
-    
-    recovery_vaults = {"total": 0, "regions": {}}
-    backup_policies = {"count": 0, "types": {}}
-    protected_items = {"vms": 0, "sql": 0, "storage": 0, "files": 0}
-    
-    for sub_id, data in all_data.items():
-        if "error" in data: continue
-        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        resources = data.get("resources", [])
+    if checked_resources["sql"] > 0:
+        # Note TDE is default
+        summary_points.append(f"- **SQL Databases**: Transparent Data Encryption (TDE) enabled by default (at rest)")
         
-        for res in resources:
-            if not isinstance(res, dict): continue
-            res_type = res.get("type", "").lower()
-            
-            if res_type == "microsoft.recoveryservices/vaults":
-                recovery_vaults["total"] += 1
-                location = res.get("location", "Unknown")
-                recovery_vaults["regions"][location] = recovery_vaults["regions"].get(location, 0) + 1
-                
-                # Check for backup policies and protected items
-                # Note: In a real implementation, we would need detailed API calls to get this data
-                # Here we'll use naming conventions to make educated guesses
-                name = res.get("name", "").lower()
-                
-                # Infer policies from common naming patterns
-                if "vm" in name or "virtual" in name:
-                    backup_policies["count"] += 1
-                    backup_policies["types"]["VM"] = backup_policies["types"].get("VM", 0) + 1
-                    protected_items["vms"] += 3  # Estimate based on name
-                
-                if "sql" in name or "database" in name:
-                    backup_policies["count"] += 1
-                    backup_policies["types"]["SQL"] = backup_policies["types"].get("SQL", 0) + 1
-                    protected_items["sql"] += 2  # Estimate based on name
-                
-                if "storage" in name or "blob" in name:
-                    backup_policies["count"] += 1
-                    backup_policies["types"]["Storage"] = backup_policies["types"].get("Storage", 0) + 1
-                    protected_items["storage"] += 1  # Estimate based on name
-                
-                if "file" in name or "share" in name:
-                    backup_policies["count"] += 1
-                    backup_policies["types"]["File"] = backup_policies["types"].get("File", 0) + 1
-                    protected_items["files"] += 1  # Estimate based on name
-    
-    # Build the summary
-    if recovery_vaults["total"] == 0:
-        return "_No Recovery Services Vaults detected that would be used for backups._"
-    
-    # Recovery Vaults summary
-    backup_findings.append(f"**Azure Backup Infrastructure:** {recovery_vaults['total']} Recovery Services Vault(s) detected")
-    
-    # Regional distribution
-    if recovery_vaults["regions"]:
-        backup_findings.append("\n**Regional Distribution:**")
-        for region, count in sorted(recovery_vaults["regions"].items(), key=lambda x: x[1], reverse=True):
-            backup_findings.append(f"- {region}: {count} vault(s)")
-    
-    # Backup policies
-    if backup_policies["count"] > 0:
-        backup_findings.append(f"\n**Backup Protection:** Approximately {backup_policies['count']} backup policies detected")
-        for policy_type, count in backup_policies["types"].items():
-            backup_findings.append(f"- {policy_type}: ~{count} policies")
-    
-    # Protected items (estimated)
-    total_items = sum(protected_items.values())
-    if total_items > 0:
-        backup_findings.append(f"\n**Protected Resources (Estimated):** ~{total_items} resources protected by backup")
-        for item_type, count in protected_items.items():
-            if count > 0:
-                item_display = item_type.upper() if item_type == "vm" else item_type.capitalize()
-                backup_findings.append(f"- {item_display}s: ~{count} resources")
-    
-    backup_findings.append("\n_Note: Detailed backup information requires specific backup API queries beyond the basic resource inventory._")
-    
-    return "\n".join(backup_findings)
-
-def _get_data_sovereignty_analysis(all_data):
-    """Analyzes data sovereignty based on resource distribution across regions."""
-    # Track resources by region
-    regions = {}
-    resource_types_by_region = {}
-    
-    for sub_id, data in all_data.items():
-        if "error" in data: continue
-        resources = data.get("resources", [])
-        
-        for res in resources:
-            if not isinstance(res, dict): continue
-            location = res.get("location", "")
-            if not location: continue  # Skip global resources
-            
-            # Count resources by region
-            regions[location] = regions.get(location, 0) + 1
-            
-            # Track data-related resource types by region
-            res_type = res.get("type", "").lower()
-            if any(data_type in res_type for data_type in ["storage", "sql", "cosmos", "mysql", "postgresql", "cache", "datalake"]):
-                if location not in resource_types_by_region:
-                    resource_types_by_region[location] = {}
-                
-                simple_type = res_type.split('/')[-1]
-                resource_types_by_region[location][simple_type] = resource_types_by_region[location].get(simple_type, 0) + 1
-    
-    # Build the analysis
-    if not regions:
-        return "_No regional distribution information found to analyze data sovereignty._"
-    
-    findings = []
-    
-    # Primary regions
-    sorted_regions = sorted(regions.items(), key=lambda x: x[1], reverse=True)
-    primary_regions = sorted_regions[:3]  # Top 3 regions
-    
-    findings.append(f"**Data Location Summary:** Resources deployed across {len(regions)} region(s)")
-    findings.append("\n**Primary Data Regions:**")
-    for region, count in primary_regions:
-        percentage = (count / sum(regions.values())) * 100
-        findings.append(f"- **{region}**: {count} resources ({percentage:.1f}% of total)")
-        
-        # Add data-specific resources for this region
-        if region in resource_types_by_region:
-            data_types = resource_types_by_region[region]
-            data_resources = sum(data_types.values())
-            findings.append(f"  - *Data Services*: {data_resources} data-related resources:")
-            for data_type, type_count in sorted(data_types.items(), key=lambda x: x[1], reverse=True):
-                findings.append(f"    - {data_type}: {type_count}")
-    
-    # Multi-region presence
-    if len(regions) > 1:
-        findings.append("\n**Multi-Region Considerations:**")
-        findings.append("- Data is distributed across multiple regions, suggesting a potential for multi-region resiliency")
-        findings.append("- Consider data residency requirements for sensitive data in each region")
-        findings.append("- Review data replication policies for cross-region data movement")
-    
-    # Sovereignty implications
-    findings.append("\n**Sovereignty Implications:**")
-    
-    # Group regions by country/continent for sovereignty analysis
-    region_groupings = {}
-    for region in regions.keys():
-        if "europe" in region or "uk" in region or "france" in region or "germany" in region:
-            region_groupings["Europe"] = region_groupings.get("Europe", 0) + regions[region]
-        elif "us" in region or "canada" in region:
-            region_groupings["North America"] = region_groupings.get("North America", 0) + regions[region]
-        elif "asia" in region or "india" in region or "japan" in region or "korea" in region:
-            region_groupings["Asia Pacific"] = region_groupings.get("Asia Pacific", 0) + regions[region]
-        elif "australia" in region:
-            region_groupings["Australia"] = region_groupings.get("Australia", 0) + regions[region]
-        elif "brazil" in region:
-            region_groupings["South America"] = region_groupings.get("South America", 0) + regions[region]
-        elif "uae" in region or "south africa" in region:
-            region_groupings["Middle East & Africa"] = region_groupings.get("Middle East & Africa", 0) + regions[region]
-        else:
-            region_groupings["Other"] = region_groupings.get("Other", 0) + regions[region]
-    
-    for region_group, count in sorted(region_groupings.items(), key=lambda x: x[1], reverse=True):
-        percentage = (count / sum(regions.values())) * 100
-        findings.append(f"- **{region_group}**: {percentage:.1f}% of resources")
-    
-    findings.append("\n_Note: Full data sovereignty analysis requires detailed classification of data types and understanding of regulatory requirements._")
-    
-    return "\n".join(findings)
+    if checked_resources["disk"] > 0:
+         disk_perc = (encrypted_resources["disk_ade_sse_cmk"] / checked_resources["disk"]) * 100 if checked_resources["disk"] > 0 else 0
+         summary_points.append(f"- **Managed Disks**: {disk_perc:.1f}% using detected encryption (SSE-PMK/CMK or ADE) (at rest)")
+         
+    if checked_resources["kv"] > 0:
+         kv_perc = (encrypted_resources["kv_soft_delete"] / checked_resources["kv"]) * 100 if checked_resources["kv"] > 0 else 0
+         summary_points.append(f"- **Key Vaults**: Soft-delete enabled on {kv_perc:.1f}% (recovery)")
+         
+    if not summary_points:
+         return "_Encryption status analysis unavailable or no relevant resources found._"
+         
+    return "Data Encryption Highlights (At Rest & Transit):\n" + "\n".join(summary_points)
 
 def _get_data_classification_analysis(all_data):
-    """Analyzes data classification based on resource tags."""
-    # Common data classification tags to look for
-    classification_tag_keys = [
-        "dataclassification", "data-classification", "data_classification", 
-        "confidentiality", "sensitivity", "pii", "compliance",
-        "security-classification", "security_classification"
-    ]
-    
-    # Track classification tag usage
-    classification_tags = {}
-    resources_with_classification = 0
-    data_related_resources = 0
-    unclassified_data_resources = 0
-    
-    # Look for common data classification frameworks in tag values
-    common_classifications = {
-        "public": 0,
-        "internal": 0,
-        "confidential": 0,
-        "restricted": 0,
-        "secret": 0,
-        "pii": 0,
-        "phi": 0,
-        "pci": 0
-    }
-    
-    for sub_id, data in all_data.items():
-        if "error" in data: continue
-        resources = data.get("resources", [])
-        
-        for res in resources:
-            if not isinstance(res, dict): continue
-            res_type = res.get("type", "").lower()
-            
-            # Check if this is a data-related resource
-            is_data_resource = any(data_type in res_type for data_type in [
-                "storage", "sql", "cosmos", "mysql", "postgresql", 
-                "cache", "datalake", "eventgrid", "servicebus", 
-                "eventhub", "redis", "documentdb"
-            ])
-            
-            if is_data_resource:
-                data_related_resources += 1
-                
-                # Check for classification tags
-                tags = res.get("tags", {})
-                if not tags or not isinstance(tags, dict):
-                    unclassified_data_resources += 1
-                    continue
-                
-                # Look for classification tags
-                found_classification = False
-                for key, value in tags.items():
-                    key_lower = key.lower()
-                    
-                    # Check if this is a classification-related tag
-                    if any(class_key in key_lower for class_key in classification_tag_keys):
-                        found_classification = True
-                        resources_with_classification += 1
-                        
-                        # Add to our classification tag dictionary
-                        if key_lower not in classification_tags:
-                            classification_tags[key_lower] = {}
-                        
-                        # Track the value
-                        value_lower = value.lower() if isinstance(value, str) else str(value).lower()
-                        classification_tags[key_lower][value_lower] = classification_tags[key_lower].get(value_lower, 0) + 1
-                        
-                        # Check for common classification frameworks
-                        for class_name in common_classifications.keys():
-                            if class_name in value_lower:
-                                common_classifications[class_name] += 1
-                
-                if not found_classification:
-                    unclassified_data_resources += 1
-    
-    # Build the analysis
-    if data_related_resources == 0:
-        return "_No data-related resources found to analyze classification._"
-    
-    findings = []
-    
-    # Overall stats
-    classification_percentage = (resources_with_classification / data_related_resources) * 100 if data_related_resources > 0 else 0
-    findings.append(f"**Data Classification Analysis:** {resources_with_classification}/{data_related_resources} ({classification_percentage:.1f}%) of data resources have classification tags")
-    
-    # Most common classification tag keys
-    if classification_tags:
-        findings.append("\n**Common Classification Tag Keys:**")
-        # Sort tag keys by frequency of use
-        sorted_tags = sorted(classification_tags.items(), key=lambda x: sum(x[1].values()), reverse=True)
-        for tag_key, values in sorted_tags[:5]:  # Show top 5
-            tag_count = sum(values.values())
-            findings.append(f"- `{tag_key}`: {tag_count} resources")
-            
-            # Show some example values
-            example_values = sorted(values.items(), key=lambda x: x[1], reverse=True)[:3]  # Top 3 values
-            value_examples = [f"{value} ({count}x)" for value, count in example_values]
-            if value_examples:
-                findings.append(f"  - Sample values: {', '.join(value_examples)}")
-    
-    # Common classification frameworks detected
-    common_class_found = sum(1 for count in common_classifications.values() if count > 0)
-    if common_class_found > 0:
-        findings.append("\n**Common Classification Frameworks Detected:**")
-        for class_name, count in sorted(common_classifications.items(), key=lambda x: x[1], reverse=True):
-            if count > 0:
-                findings.append(f"- {class_name.upper()}: {count} resources")
-    
-    # Recommendations
-    findings.append("\n**Classification Recommendations:**")
-    if classification_percentage < 20:
-        findings.append("- ⚠️ **Low Classification Coverage**: Consider implementing a data classification strategy")
-        findings.append("- Establish a consistent tagging strategy with standardized classification levels")
-        findings.append("- Apply classification tags to all data stores based on sensitivity assessment")
-    elif classification_percentage < 50:
-        findings.append("- 🔄 **Partial Classification Coverage**: Continue implementing classification strategy")
-        findings.append("- Standardize classification tags across resources to ensure consistency")
-        findings.append("- Apply Azure Policy to enforce classification tags on all data resources")
-    else:
-        findings.append("- ✅ **Good Classification Coverage**: Maintain current classification practices")
-        findings.append("- Consider automating classification validation through Azure Policy")
-        findings.append("- Review classification levels periodically to ensure they remain appropriate")
-    
-    return "\n".join(findings)
+    """Placeholder for data classification analysis."""
+    # Requires analyzing SQL DB sensitivity labels or Purview scans
+    return "_Data classification status (e.g., using SQL Sensitivity Labels or Purview) requires deeper analysis not yet implemented._"
 
-# --- Cost Section Helper ---
-
-def _get_cost_summary_table(all_data):
-    """Generates a Markdown table summarizing MTD costs per subscription."""
-    headers = ["Subscription", "MTD Actual Cost", "Currency"]
-    rows = []
-    found_any = False
-    
-    for sub_id, data in all_data.items():
-        if "error" in data:
-            # Optionally represent error state in the table
-            # rows.append([f"Subscription {sub_id}", "Error fetching data", "N/A"])
-            continue # Skip errored subscriptions for cleaner table
-
-        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        cost_data = data.get("costs")
-
-        if cost_data:
-            mtd_cost = cost_data.get("mtd_actual_cost", "Not Available")
-            currency = cost_data.get("currency", "N/A")
-            
-            # Format cost nicely, handle potential non-numeric values
-            cost_display = mtd_cost
-            if isinstance(mtd_cost, (int, float)):
-                cost_display = f"{mtd_cost:.2f}" # Format to 2 decimal places
-            
-            rows.append([sub_name, cost_display, currency])
-            found_any = True
-        else:
-            # Handle cases where cost data might be missing entirely for a sub
-            rows.append([sub_name, "Data Not Found", "N/A"])
-            
-    if not found_any:
-        return "_Month-to-Date cost data not available or found for audited subscriptions._"
-        
-    return _generate_markdown_table(headers, sorted(rows, key=lambda x: x[0]))
-
-# --- Governance Section Helpers ---
-
-def _get_policy_assignments_summary(all_data):
-    """Generates Markdown summary of common policy assignments."""
-    assignments = {}
-    for sub_id, data in all_data.items():
-        if "error" in data or "governance" not in data: continue
-        policy_assignments = data["governance"].get("policy_assignments", [])
-        for assign in policy_assignments:
-             if isinstance(assign, dict):
-                name = assign.get("display_name", assign.get("name", "Unknown"))
-                # Use display_name if available and not empty, otherwise fallback to name
-                display_name = assign.get("display_name")
-                effective_name = display_name if display_name else assign.get("name", "Unknown")
-                assignments[effective_name] = assignments.get(effective_name, 0) + 1
-             else: logging.warning(f"Skipping non-dictionary policy assignment in sub {sub_id}: {assign}")
-    if not assignments: return "_No policy assignment data available or detected._"
-    top_n = 10
-    sorted_assignments = sorted(assignments.items(), key=lambda item: item[1], reverse=True)
-    summary_lines = [f"- **{name}** ({count} scopes)" for name, count in sorted_assignments[:top_n]]
-    output = "Commonly Assigned Policies/Initiatives (Top 10):\n" + "\n".join(summary_lines)
-    if len(sorted_assignments) > top_n: output += f"\n- ... and {len(sorted_assignments) - top_n} more."
-    return output
-
-# --- Compute & Application Services Section Helpers ---
-
-def _get_app_services_table(all_data):
-    """Generates a detailed Markdown table for App Services."""
-    headers = ["Subscription", "App Name", "App Service Plan", "Runtime", "Location", "Endpoint Integration"]
-    rows = []
-    found_any = False
-    
-    for sub_id, data in all_data.items():
-        if "error" in data:
-            continue
-            
-        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        resources = data.get("resources", [])
-        
-        # Find all app service plans first for later reference
-        app_plans = {}
-        for res in resources:
-            if isinstance(res, dict) and res.get("type") == "Microsoft.Web/serverfarms":
-                app_plans[res.get("id", "").lower()] = {
-                    "name": res.get("name", "Unknown"),
-                    "sku": res.get("sku", {}).get("name", "Unknown")
-                }
-        
-        # Process all app services
-        for res in resources:
-            if isinstance(res, dict) and res.get("type") == "Microsoft.Web/sites":
-                found_any = True
-                app_name = res.get("name", "Unknown")
-                location = res.get("location", "Unknown")
-                properties = res.get("properties", {})
-                kind = res.get("kind", "app") # Default to 'app' if not specified
-                
-                # Skip function apps etc. if we only want web apps (can refine later)
-                # if "functionapp" in kind.lower(): continue
-                
-                # Get runtime stack info (Improved detection)
-                runtime = "Unknown"
-                site_config = properties.get("siteConfig", {})
-                if site_config:
-                    if site_config.get("linuxFxVersion"): runtime = site_config.get("linuxFxVersion")
-                    elif site_config.get("windowsFxVersion"): runtime = site_config.get("windowsFxVersion")
-                    elif site_config.get("javaVersion"): runtime = f'Java {site_config.get("javaVersion")}'
-                    elif site_config.get("phpVersion"): runtime = f'PHP {site_config.get("phpVersion")}'
-                    elif site_config.get("pythonVersion"): runtime = f'Python {site_config.get("pythonVersion")}'
-                    elif site_config.get("nodeVersion"): runtime = f'Node {site_config.get("nodeVersion")}'
-                    elif site_config.get("netFrameworkVersion"): runtime = f'.NET Framework {site_config.get("netFrameworkVersion")}'
-                    # Fallback checks if specific versions aren't set
-                    elif "DOCKER" in str(site_config.get("linuxFxVersion", "")).upper(): runtime = "Container (Linux)"
-                    elif "COMPOSE" in str(site_config.get("linuxFxVersion", "")).upper(): runtime = "Docker Compose"
-                    elif "dotnet" in str(site_config.get("windowsFxVersion", "")).lower(): runtime = ".NET Core (Windows)"
-                    elif site_config.get("metadata"): # Check metadata for clues
-                        metadata = site_config.get("metadata", [])
-                        current_stack = next((m.get("value") for m in metadata if m.get("name") == "CURRENT_STACK"), None)
-                        if current_stack: runtime = f"Stack: {current_stack}"
-
-                # Get App Service Plan info (Safer access)
-                plan_id = properties.get("serverFarmId", "").lower()
-                plan_info = "Unknown"
-                if plan_id in app_plans:
-                    plan = app_plans[plan_id]
-                    plan_info = f"{plan.get('name', 'Unknown')} ({plan.get('sku', 'Unknown')})"
-                elif plan_id: # Extract name if plan object wasn't found
-                    plan_info = plan_id.split('/')[-1]
-                
-                # Check for key integrations
-                integrations = []
-                # VNet integration
-                if "WEBSITE_VNET_ROUTE_ALL" in str(site_config):
-                    integrations.append("VNet")
-                # Private Endpoints
-                private_endpoints = data.get("networking", {}).get("private_endpoints", [])
-                has_private_endpoint = False
-                for pe in private_endpoints:
-                    if isinstance(pe, dict):
-                        conn = pe.get("private_link_service_connections", [])
-                        if conn and isinstance(conn[0], dict):
-                            target_id = conn[0].get("private_link_service_id", "").lower()
-                            if target_id == res.get("id", "").lower():
-                                has_private_endpoint = True
-                                break
-                if has_private_endpoint:
-                    integrations.append("Private Endpoint")
-                
-                # Check for App Insights
-                if site_config and any(k.startswith("APPINSIGHTS_") for k in site_config.keys()):
-                    integrations.append("App Insights")
-                
-                integration_str = ", ".join(integrations) if integrations else "None detected"
-                rows.append([sub_name, app_name, plan_info, runtime, location, integration_str])
-    
-    if not found_any:
-        return "_No App Services detected in the environment._"
-        
-    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
-
-def _get_vms_table(all_data):
-    """Generates Markdown table for Virtual Machines."""
-    headers = ["Subscription", "VM Name", "Size", "OS Type", "Location", "Status"]
-    rows = []
-    found_any = False
-    
-    for sub_id, data in all_data.items():
-        if "error" in data:
-            continue
-        
-        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        resources = data.get("resources", [])
-        
-        # Filter for VM resources
-        for res in resources:
-            if isinstance(res, dict) and res.get("type", "").lower() == "microsoft.compute/virtualmachines":
-                found_any = True
-                vm_name = res.get("name", "Unknown")
-                properties = res.get("properties", {})
-                
-                # Get Size
-                vm_size = properties.get("hardwareProfile", {}).get("vmSize", "Unknown")
-                if vm_size == "Unknown":
-                    vm_size = res.get("size", "Unknown") # Alternate location sometimes used
-
-                # Get OS Type (more robustly)
-                os_type = "Unknown"
-                os_profile = properties.get("osProfile", {})
-                if os_profile:
-                    if os_profile.get("windowsConfiguration"):
-                        os_type = "Windows"
-                    elif os_profile.get("linuxConfiguration"):
-                        os_type = "Linux"
-                
-                # Try alternate method if not found
-                if os_type == "Unknown":
-                    storage_profile = properties.get("storageProfile", {})
-                    os_disk = storage_profile.get("osDisk", {})
-                    os_type_from_disk = os_disk.get("osType") # Returns 'Windows' or 'Linux'
-                    if os_type_from_disk:
-                        os_type = os_type_from_disk
-
-                location = res.get("location", "Unknown")
-                # Get Status (prefer instance view)
-                status = "Unknown"
-                instance_view = properties.get("instanceView", {})
-                if instance_view:
-                    statuses = instance_view.get("statuses", [])
-                    # Look for PowerState status like 'PowerState/running' or 'PowerState/deallocated'
-                    power_status = next((s.get("displayStatus") for s in statuses if s.get("code", "").startswith("PowerState/")), None)
-                    if power_status:
-                        status = power_status
-                # Fallback to provisioning state if instance view not available/useful
-                if status == "Unknown":
-                     status = properties.get("provisioningState", "Unknown")
-
-                rows.append([sub_name, vm_name, vm_size, os_type, location, status])
-    
-    if not found_any:
-        return "_No Virtual Machines detected in the environment._"
-    
-    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
-
-def _get_serverless_summary(all_data):
-    """Generates a summary of detected serverless resources."""
-    serverless_types = {
-        "microsoft.web/sites": lambda res: res.get("kind", "").lower().startswith("functionapp"),
-        "microsoft.logic/workflows": lambda res: True,
-        "microsoft.app/containerapps": lambda res: True,
-        "microsoft.eventgrid/topics": lambda res: True, # Often used with serverless
-        "microsoft.eventgrid/systemtopics": lambda res: True, # Often used with serverless
-        "microsoft.apimanagement/service": lambda res: True # Often used with serverless
-    }
-    rows = []
-    headers = ["Subscription", "Name", "Type", "Region"]
-    found_any = False
-
-    for sub_id, data in all_data.items():
-        if "error" in data: continue
-        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        resources = data.get("resources", [])
-        for res in resources:
-            if isinstance(res, dict):
-                res_type = res.get("type", "").lower()
-                if res_type in serverless_types and serverless_types[res_type](res):
-                    # Map type to a friendlier name
-                    friendly_type = "Unknown Serverless"
-                    if "functionapp" in res.get("kind", "").lower():
-                        friendly_type = "Function App"
-                    elif res_type == "microsoft.logic/workflows":
-                        friendly_type = "Logic App"
-                    elif res_type == "microsoft.app/containerapps":
-                        friendly_type = "Container App"
-                    elif "eventgrid" in res_type:
-                        friendly_type = "Event Grid Topic"
-                    elif "apimanagement" in res_type:
-                         friendly_type = "API Management"
-                    
-                    rows.append([
-                        sub_name,
-                        res.get("name", "Unknown"),
-                        friendly_type,
-                        res.get("location", "Unknown")
-                    ])
-                    found_any = True
-
-    if not found_any:
-        return "_No common serverless components (Function Apps, Logic Apps, Container Apps, etc.) detected in the audited subscriptions._"
-        
-    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[2], x[1])))
-
-# --- Network Section Helper Additions ---
-
-def _get_service_endpoints_summary(all_data):
-    """Generates a summary of configured Service Endpoints on subnets."""
-    endpoints_found = []
-    subnet_count = 0
-    for sub_id, data in all_data.items():
-        if "error" in data or "networking" not in data: continue
-        subnets = data.get("networking", {}).get("subnets", [])
-        for subnet in subnets:
-            if isinstance(subnet, dict):
-                subnet_count += 1
-                service_endpoints = subnet.get("service_endpoints", [])
-                if service_endpoints:
-                    for ep in service_endpoints:
-                        if isinstance(ep, dict):
-                            service_name = ep.get("service", "UnknownService")
-                            # Add unique service names
-                            if service_name not in endpoints_found:
-                                endpoints_found.append(service_name)
-    
-    if not endpoints_found:
-        return "_No Service Endpoints detected on analyzed subnets._"
-    else:
-        return f"Service Endpoints detected for: **{', '.join(sorted(endpoints_found))}** (Analyzed {subnet_count} subnets across subscriptions)."
-
-def _get_private_link_services_table(all_data):
-    """Generates a Markdown table for discovered Private Link Services."""
-    headers = ["Subscription", "Service Name", "Location", "Alias", "Connections"]
-    rows = []
-    found_any = False
-
-    for sub_id, data in all_data.items():
-        if "error" in data or "resources" not in data:
-            continue
-        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        resources = data.get("resources", [])
-        for res in resources:
-            if isinstance(res, dict) and res.get("type", "").lower() == "microsoft.network/privatelinkservices":
-                found_any = True
-                properties = res.get("properties", {})
-                name = res.get("name", "Unknown")
-                location = res.get("location", "Unknown")
-                alias = properties.get("alias", "N/A")
-                # Note: Getting exact connection count requires expanding the resource properties during fetch or separate API call
-                # We'll use a placeholder for now based on whether the PE connections list exists
-                pe_connections = properties.get("privateEndpointConnections", [])
-                connection_count = len(pe_connections) if isinstance(pe_connections, list) else "Unknown"
-                
-                rows.append([sub_name, name, location, alias, str(connection_count)])
-            
-    if not found_any:
-        return "_No Private Link Services detected in the audited subscriptions._"
-        
-    return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
-
-# --- New Analysis Helpers --- 
-
-def _analyze_rg_naming_patterns(all_data):
-    """Analyzes resource group names for common patterns (prefixes/suffixes)."""
-    rg_names = set()
+def _get_data_sovereignty_analysis(all_data):
+    """Analyzes resource locations to infer data sovereignty adherence."""
+    region_counts = {}
     for sub_id, data in all_data.items():
         if "error" in data or "resources" not in data: continue
         for res in data["resources"]:
-            if isinstance(res, dict) and res.get("resource_group"):
-                rg_names.add(res.get("resource_group"))
+            if isinstance(res, dict) and "location" in res:
+                loc = res["location"]
+                if loc: region_counts[loc] = region_counts.get(loc, 0) + 1
     
-    if not rg_names:
-        return "_No resource groups found to analyze naming patterns._"
+    if not region_counts:
+        return "_Could not analyze resource locations for data sovereignty._"
         
-    patterns = {"prefixes": {}, "suffixes": {}, "separators": {}}
-    separators = ['-', '_', '.']
-    
-    for name in rg_names:
-        # Check separators
-        for sep in separators:
-            if sep in name:
-                patterns["separators"][sep] = patterns["separators"].get(sep, 0) + 1
-                parts = name.split(sep)
-                if len(parts) > 1:
-                    prefix = parts[0]
-                    suffix = parts[-1]
-                    patterns["prefixes"][prefix] = patterns["prefixes"].get(prefix, 0) + 1
-                    patterns["suffixes"][suffix] = patterns["suffixes"].get(suffix, 0) + 1
-                break # Assume primary separator
-    
-    # Summarize findings
-    summary = []
-    dominant_sep = max(patterns["separators"], key=patterns["separators"].get) if patterns["separators"] else "None"
-    summary.append(f"Dominant Separator: '{dominant_sep}'")
-    
-    top_prefixes = sorted(patterns["prefixes"].items(), key=lambda item: item[1], reverse=True)[:3]
-    if top_prefixes:
-        summary.append("Common Prefixes: " + ", ".join([f"`{p}` ({c}x)" for p, c in top_prefixes]))
-    
-    top_suffixes = sorted(patterns["suffixes"].items(), key=lambda item: item[1], reverse=True)[:3]
-    if top_suffixes:
-        summary.append("Common Suffixes: " + ", ".join([f"`{s}` ({c}x)" for s, c in top_suffixes]))
-        
-    if not top_prefixes and not top_suffixes:
-         summary.append("No strong prefix/suffix patterns detected based on common separators.")
-         
-    return "Summary: " + "; ".join(summary)
+    # Simply list the top regions where resources reside
+    sorted_regions = sorted(region_counts.items(), key=lambda item: item[1], reverse=True)
+    primary_regions = [f"{region} ({count} resources)" for region, count in sorted_regions[:3]]
+    return f"Resources primarily located in: {', '.join(primary_regions)}. Ensure these align with data sovereignty requirements."
 
-def _analyze_resource_lifecycle(all_data):
-    """Analyzes resource tags for lifecycle hints."""
-    tags_found = {
-        "environment": 0, "owner": 0, "costCenter": 0,
-        "createdDate": 0, "ttl": 0, "project": 0
-    }
-    tagged_resource_count = 0
+def _get_subscription_costs_table(all_data):
+    """Generates Markdown table for subscription costs."""
+    headers = ["Subscription", "MTD Cost", "YTD Cost", "Forecast (30d)", "Currency"]
+    rows = []
+    
+    for sub_id, data in all_data.items():
+        if "error" in data or "costs" not in data:
+            continue
+            
+        costs = data.get("costs", {})
+        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
+        currency = costs.get("currency", "N/A")
+        
+        mtd_cost = f"{costs.get('mtd_actual_cost', 'N/A'):,.2f}" if costs.get('mtd_actual_cost') is not None else "N/A"
+        ytd_cost = f"{costs.get('ytd_actual_cost', 'N/A'):,.2f}" if costs.get('ytd_actual_cost') is not None else "N/A"
+        forecast = f"{costs.get('forecast_cost', 'N/A'):,.2f}" if costs.get('forecast_cost') is not None else "N/A"
+        
+        rows.append([sub_name, mtd_cost, ytd_cost, forecast, currency])
+    
+    if not rows:
+        return "_No cost data available. This may be due to insufficient permissions or no cost data for the current period._"
+    
+    return _generate_markdown_table(headers, sorted(rows, key=lambda x: float(x[1].replace(',', '')) if x[1] != 'N/A' else 0, reverse=True))
+
+def _get_resource_type_costs(all_data):
+    """Analyzes and summarizes costs by resource type."""
+    resource_costs = {}
+    total_cost = 0
+    currency = None
+    
+    for sub_id, data in all_data.items():
+        if "error" in data or "costs" not in data:
+            continue
+            
+        costs = data.get("costs", {})
+        if not currency:
+            currency = costs.get("currency")
+            
+        for resource in costs.get("resource_costs", []):
+            resource_type = resource.get("resource_type", "Unknown")
+            cost = resource.get("cost", 0)
+            resource_costs[resource_type] = resource_costs.get(resource_type, 0) + cost
+            total_cost += cost
+    
+    if not resource_costs:
+        return "_No resource cost data available._"
+    
+    # Sort by cost and get top resource types
+    sorted_costs = sorted(resource_costs.items(), key=lambda x: x[1], reverse=True)
+    top_resources = sorted_costs[:5]  # Get top 5 resource types
+    
+    summary = []
+    summary.append("**Top Resource Types by Cost:**")
+    for resource_type, cost in top_resources:
+        percentage = (cost / total_cost * 100) if total_cost > 0 else 0
+        summary.append(f"- {resource_type}: {cost:,.2f} {currency} ({percentage:.1f}%)")
+    
+    if len(sorted_costs) > 5:
+        other_cost = sum(cost for _, cost in sorted_costs[5:])
+        other_percentage = (other_cost / total_cost * 100) if total_cost > 0 else 0
+        summary.append(f"- Others: {other_cost:,.2f} {currency} ({other_percentage:.1f}%)")
+    
+    return "\n".join(summary)
+
+def _get_cost_allocation_summary(all_data):
+    """Analyzes cost allocation based on tags and resource groups."""
+    summary = []
+    tagged_resources = 0
     total_resources = 0
+    total_cost = 0
+    cost_by_rg = {}
     
     for sub_id, data in all_data.items():
-        if "error" in data or "resources" not in data: continue
-        resources = data["resources"]
-        total_resources += len(resources)
-        for res in resources:
-            if isinstance(res, dict):
-                tags = res.get("tags")
-                if tags and isinstance(tags, dict):
-                    tagged_resource_count +=1
-                    for key in tags.keys():
-                        # Case-insensitive check for common lifecycle tags
-                        key_lower = key.lower()
-                        for lifecycle_key in tags_found:
-                            if lifecycle_key.lower() == key_lower:
-                                tags_found[lifecycle_key] += 1
-                                break
-    
-    if total_resources == 0:
-        return "_No resources found to analyze lifecycle management._"
+        if "error" in data or "costs" not in data:
+            continue
+            
+        costs = data.get("costs", {})
+        currency = costs.get("currency", "N/A")
         
+        for resource in costs.get("resource_costs", []):
+            total_resources += 1
+            cost = resource.get("cost", 0)
+            total_cost += cost
+            
+            # Extract resource group from resource ID
+            resource_id = resource.get("resource_id", "")
+            rg_name = resource_id.split('/')[4] if len(resource_id.split('/')) > 4 else "Unknown"
+            cost_by_rg[rg_name] = cost_by_rg.get(rg_name, 0) + cost
+    
+    if not total_resources:
+        return "_No cost allocation data available._"
+    
+    # Get top resource groups by cost
+    sorted_rgs = sorted(cost_by_rg.items(), key=lambda x: x[1], reverse=True)[:5]
+    
+    summary.append("**Cost Allocation Summary:**")
+    summary.append(f"- Total Monthly Cost: {total_cost:,.2f} {currency}")
+    summary.append("\n**Top Resource Groups by Cost:**")
+    for rg, cost in sorted_rgs:
+        percentage = (cost / total_cost * 100) if total_cost > 0 else 0
+        summary.append(f"- {rg}: {cost:,.2f} {currency} ({percentage:.1f}%)")
+    
+    return "\n".join(summary)
+
+def _get_cost_optimization_summary(all_data):
+    """Analyzes potential cost optimization opportunities."""
     summary = []
-    tag_coverage = (tagged_resource_count / total_resources * 100) if total_resources > 0 else 0
-    summary.append(f"Tag Coverage: {tagged_resource_count}/{total_resources} ({tag_coverage:.1f}%) resources tagged.")
-    
-    detected_tags = [f"`{key}` ({count}x)" for key, count in tags_found.items() if count > 0]
-    if detected_tags:
-        summary.append("Common Lifecycle-Related Tags Detected: " + ", ".join(detected_tags))
-    else:
-        summary.append("No common lifecycle-related tags (e.g., environment, owner, createdDate, ttl) detected.")
-        
-    if tag_coverage < 50 or not any(k in tags_found for k in ["owner", "environment"]):
-         summary.append("Recommendation: Enhance tagging for better lifecycle tracking (e.g., Owner, Environment, CreatedDate). Consider Azure Policy for enforcement.")
-         
-    return "Summary: " + "; ".join(summary)
-
-def _analyze_rbac_approach(all_data):
-    """Provides a summary of RBAC assignment patterns."""
-    total_assignments = 0
-    custom_role_assignments = 0
-    built_in_role_assignments = 0
-    role_counts = {}
-    scopes = {"Subscription": 0, "Resource Group": 0, "Resource": 0, "Management Group": 0, "Unknown": 0}
+    vm_costs = {}
+    storage_costs = {}
+    currency = None
     
     for sub_id, data in all_data.items():
-        if "error" in data or "security" not in data: continue
-        assignments = data["security"].get("role_assignments", [])
-        total_assignments += len(assignments)
-        for assign in assignments:
-            if isinstance(assign, dict):
-                role_def_id = assign.get("role_definition_id", "")
-                role_name = assign.get("role_name", "Unknown Role") # Use pre-fetched name
-                role_counts[role_name] = role_counts.get(role_name, 0) + 1
-                
-                # Check if it's a custom role (heuristic: ID doesn't contain builtInRoles)
-                if "/providers/Microsoft.Authorization/roleDefinitions/" in role_def_id and "builtInRoles" not in role_def_id:
-                    custom_role_assignments += 1
-                else:
-                    built_in_role_assignments += 1
-                    
-                # Analyze scope
-                scope = assign.get("scope", "")
-                if "/subscriptions/" in scope and "/resourceGroups/" in scope and "/providers/" in scope:
-                     scopes["Resource"] += 1
-                elif "/subscriptions/" in scope and "/resourceGroups/" in scope:
-                     scopes["Resource Group"] += 1
-                elif "/subscriptions/" in scope:
-                     scopes["Subscription"] += 1
-                elif "/providers/Microsoft.Management/managementGroups/" in scope:
-                     scopes["Management Group"] += 1
-                else:
-                     scopes["Unknown"] += 1
-                     
-    if total_assignments == 0:
-         return "_No role assignments found in the analyzed subscriptions._"
-         
-    summary = [f"Total Assignments Found: {total_assignments}"]
-    if custom_role_assignments > 0:
-        summary.append(f"Custom Role Usage: {custom_role_assignments} assignments detected.")
-    else:
-        summary.append("Custom Role Usage: None detected.")
-        
-    # Top 5 roles
-    top_roles = sorted(role_counts.items(), key=lambda item: item[1], reverse=True)[:5]
-    if top_roles:
-         summary.append("Most Common Roles: " + ", ".join([f"{name} ({count}x)" for name, count in top_roles]))
-         
-    # Scope distribution
-    scope_summary = [f"{scope_name}: {count}" for scope_name, count in scopes.items() if count > 0]
-    if scope_summary:
-         summary.append("Assignment Scopes: " + ", ".join(scope_summary))
-         
-    return "; ".join(summary)
-
-def _summarize_web_apps(all_data):
-    """Summarizes detected Web App resources."""
-    count = 0
-    kinds = set()
-    for sub_id, data in all_data.items():
-        if "error" in data or "resources" not in data: continue
-        for res in data["resources"]:
-            if isinstance(res, dict) and res.get("type", "").lower() == "microsoft.web/sites":
-                 # Exclude function apps from this specific summary if needed
-                 kind = res.get("kind", "app").lower()
-                 if "functionapp" not in kind:
-                      count += 1
-                      kinds.add("Web App" if "app" in kind else kind.capitalize()) 
-                      
-    if count == 0:
-        return "_No dedicated Web App resources (excluding Function Apps) detected._"
-    else:
-        kind_str = ", ".join(sorted(list(kinds)))
-        return f"Detected {count} Web App instance(s). Types include: {kind_str}. See detailed table in Section 5.1."
-
-def _summarize_api_services(all_data):
-    """Summarizes detected API Management resources."""
-    count = 0
-    skus = set()
-    for sub_id, data in all_data.items():
-        if "error" in data or "resources" not in data: continue
-        for res in data["resources"]:
-            if isinstance(res, dict) and res.get("type", "").lower() == "microsoft.apimanagement/service":
-                 count += 1
-                 sku_name = res.get("sku", {}).get("name", "Unknown")
-                 skus.add(sku_name)
-                 
-    if count == 0:
-         return "_No API Management service instances detected._"
-    else:
-         sku_str = ", ".join(sorted(list(skus)))
-         return f"Detected {count} API Management instance(s). SKUs include: {sku_str}."
-
-def _summarize_container_services(all_data):
-    """Summarizes detected Container services (AKS, ACI, Container Apps)."""
-    services = {"AKS": 0, "ACI": 0, "Container Apps": 0}
+        if "error" in data or "costs" not in data:
+            continue
+            
+        costs = data.get("costs", {})
+        if not currency:
+            currency = costs.get("currency")
+            
+        for resource in costs.get("resource_costs", []):
+            resource_type = resource.get("resource_type", "").lower()
+            cost = resource.get("cost", 0)
+            
+            if "virtualmachines" in resource_type:
+                vm_costs[resource.get("resource_id")] = cost
+            elif "storageaccounts" in resource_type:
+                storage_costs[resource.get("resource_id")] = cost
     
-    for sub_id, data in all_data.items():
-        if "error" in data or "resources" not in data: continue
-        for res in data["resources"]:
-            if isinstance(res, dict):
-                res_type = res.get("type", "").lower()
-                if res_type == "microsoft.containerservice/managedclusters":
-                    services["AKS"] += 1
-                elif res_type == "microsoft.containerinstance/containergroups":
-                    services["ACI"] += 1
-                elif res_type == "microsoft.app/containerapps":
-                    services["Container Apps"] += 1
-                    
-    detected = [f"{name}: {count}" for name, count in services.items() if count > 0]
-    if not detected:
-         return "_No common Container Services (AKS, ACI, Container Apps) detected._"
-    else:
-         return f"Detected Container Services: {'; '.join(detected)}."
-
-def _analyze_lifecycle_policies(all_data):
-    """Analyzes policy assignments for keywords related to lifecycle management."""
-    keywords = ["lifecycle", "retention", "delete", "archive", "tagging", "owner", "environment", "cost"]
-    policy_count = 0
-    relevant_policies = []
+    if not vm_costs and not storage_costs:
+        return "_No cost optimization data available._"
     
-    for sub_id, data in all_data.items():
-        if "error" in data or "governance" not in data: continue
-        assignments = data["governance"].get("policy_assignments", [])
-        for assign in assignments:
-             if isinstance(assign, dict):
-                 name = assign.get("display_name", assign.get("name", "")).lower()
-                 description = assign.get("description", "").lower()
-                 if any(keyword in name or keyword in description for keyword in keywords):
-                     policy_count += 1
-                     # Add policy name if not already added
-                     policy_display = assign.get("display_name", assign.get("name", "Unknown"))
-                     if policy_display not in relevant_policies: relevant_policies.append(policy_display)
-                     
-    if policy_count == 0:
-         return "_No Azure Policy assignments detected specifically targeting resource lifecycle or governance tags._"
-    else:
-         policy_list = ", ".join(relevant_policies[:3]) + ("..." if len(relevant_policies) > 3 else "")
-         return f"{policy_count} policy assignments found potentially related to lifecycle/governance (e.g., {policy_list}). Review policy details for specifics."
-
-def _analyze_service_principals(all_data):
-    """Provides a summary based on the stubbed service principal fetcher."""
-    # Since it's tenant-level, check the first subscription's data
-    first_sub_key = next(iter(all_data), None)
-    if not first_sub_key:
-        return "_No subscription data available to check service principal status._"
-        
-    sp_info = all_data[first_sub_key].get("identity", {}).get("service_principals", {})
-    status = sp_info.get('status', 'unknown')
+    summary.append("**Cost Optimization Opportunities:**")
     
-    if status == 'fetcher_not_implemented':
-        return "_Service Principal fetcher requires full implementation (likely using MS Graph API)._"
-    elif status == 'requires_graph_api_access':
-        return "_Service Principal analysis requires Entra ID Graph API access permissions._"
-    elif status == 'error_checking_access':
-        return "_Error occurred while trying to check for Graph API access for Service Principal analysis._"
-    else:
-        return "_Could not determine Service Principal status._"
+    # VM Cost Analysis
+    if vm_costs:
+        total_vm_cost = sum(vm_costs.values())
+        summary.append(f"\n*Virtual Machine Costs:*")
+        summary.append(f"- Total VM Cost: {total_vm_cost:,.2f} {currency}")
+        if len(vm_costs) > 0:
+            avg_vm_cost = total_vm_cost / len(vm_costs)
+            summary.append(f"- Average Cost per VM: {avg_vm_cost:,.2f} {currency}")
+            
+            # Identify potentially oversized VMs (significantly above average)
+            expensive_vms = [(vm, cost) for vm, cost in vm_costs.items() if cost > avg_vm_cost * 1.5]
+            if expensive_vms:
+                summary.append("- VMs to Review (Above 150% avg cost):")
+                for vm, cost in sorted(expensive_vms, key=lambda x: x[1], reverse=True)[:3]:
+                    vm_name = vm.split('/')[-1]
+                    summary.append(f"  * {vm_name}: {cost:,.2f} {currency}")
+    
+    # Storage Cost Analysis
+    if storage_costs:
+        total_storage_cost = sum(storage_costs.values())
+        summary.append(f"\n*Storage Costs:*")
+        summary.append(f"- Total Storage Cost: {total_storage_cost:,.2f} {currency}")
+        if len(storage_costs) > 0:
+            avg_storage_cost = total_storage_cost / len(storage_costs)
+            summary.append(f"- Average Cost per Storage Account: {avg_storage_cost:,.2f} {currency}")
+    
+    return "\n".join(summary)
+
+# ... rest of the existing code ...
+
+def _get_ai_services_summary(data):
+    """
+    Generates a summary of AI services for a subscription.
+    """
+    if not data or not isinstance(data, dict):
+        return "_No AI services data available._"
+
+    # Get AI services data
+    ai_data = data.get("ai_services", {})
+    if not ai_data or not isinstance(ai_data, dict):
+        return "_No AI services found in this subscription._"
+
+    sections = []
+    
+    # Cognitive Services
+    cognitive_services = ai_data.get("cognitive_services", [])
+    if cognitive_services and isinstance(cognitive_services, list):
+        sections.append("#### Cognitive Services\n")
+        headers = ["Name", "Type", "Location", "SKU"]
+        rows = []
+        for service in cognitive_services:
+            if isinstance(service, dict):
+                rows.append([
+                    service.get("name", "N/A"),
+                    service.get("type", "N/A"),
+                    service.get("location", "N/A"),
+                    service.get("sku", "N/A")
+                ])
+        if rows:
+            sections.append(_generate_markdown_table(headers, sorted(rows, key=lambda x: x[0])))
+            sections.append("\n")
+
+    # Search Services
+    search_services = ai_data.get("search_services", [])
+    if search_services and isinstance(search_services, list):
+        sections.append("#### Azure Search Services\n")
+        headers = ["Name", "Location", "SKU", "Replicas", "Partitions"]
+        rows = []
+        for service in search_services:
+            if isinstance(service, dict):
+                rows.append([
+                    service.get("name", "N/A"),
+                    service.get("location", "N/A"),
+                    service.get("sku", "N/A"),
+                    str(service.get("replica_count", "N/A")),
+                    str(service.get("partition_count", "N/A"))
+                ])
+        if rows:
+            sections.append(_generate_markdown_table(headers, sorted(rows, key=lambda x: x[0])))
+            sections.append("\n")
+
+    # Bot Services
+    bot_services = ai_data.get("bot_services", [])
+    if bot_services and isinstance(bot_services, list):
+        sections.append("#### Bot Services\n")
+        headers = ["Name", "Location", "Kind", "SKU"]
+        rows = []
+        for service in bot_services:
+            if isinstance(service, dict):
+                rows.append([
+                    service.get("name", "N/A"),
+                    service.get("location", "N/A"),
+                    service.get("kind", "N/A"),
+                    service.get("sku", "N/A")
+                ])
+        if rows:
+            sections.append(_generate_markdown_table(headers, sorted(rows, key=lambda x: x[0])))
+            sections.append("\n")
+
+    if not sections:
+        return "_No AI services found in this subscription._"
+
+    return "\n".join(sections)
+
+def _get_data_platform_section(subscription_data):
+    """
+    Generates the Data Platform section of the design document.
+    This section covers databases, storage accounts, data lakes, and analytics services.
+    """
+    sections = []
+    
+    sections.append("""
+This section provides an overview of data platform services deployed across the environment, including databases, storage accounts, data lakes, and analytics services.
+
+#### Overview
+The following subsections detail the data platform components currently deployed, their configurations, and associated resources.
+""")
+
+    # Add Storage Accounts summary
+    sections.append("### Storage Accounts\n")
+    storage_table = _get_storage_accounts_table(subscription_data)
+    sections.append(storage_table if storage_table else "_No storage accounts found._\n")
+
+    # Add Database summary
+    sections.append("\n### Databases\n")
+    db_table = _get_databases_table(subscription_data)
+    sections.append(db_table if db_table else "_No databases found._\n")
+
+    # Add Analytics Services
+    sections.append("\n### Analytics Services\n")
+    analytics_table = _get_analytics_services_table(subscription_data)
+    sections.append(analytics_table if analytics_table else "_No analytics services found._\n")
+
+    # Add Data Lake Analysis
+    sections.append("\n### Data Lake Storage\n")
+    lake_analysis = _get_data_lake_analysis(subscription_data)
+    sections.append(lake_analysis if lake_analysis else "_No data lake storage found._\n")
+
+    # Add Data Classification and Sovereignty
+    sections.append("\n### Data Governance\n")
+    
+    sections.append("#### Data Classification\n")
+    classification = _get_data_classification_analysis(subscription_data)
+    sections.append(classification if classification else "_No data classification information available._\n")
+    
+    sections.append("\n#### Data Sovereignty\n")
+    sovereignty = _get_data_sovereignty_analysis(subscription_data)
+    sections.append(sovereignty if sovereignty else "_No data sovereignty information available._\n")
+
+    return "\n".join(sections)
+
+def _get_security_section(subscription_data):
+    """
+    Generates the Security & Compliance section of the design document.
+    This section covers security controls, compliance status, and security recommendations.
+    """
+    sections = []
+    
+    sections.append("""
+This section provides an overview of security controls and compliance status across the environment, including Microsoft Defender for Cloud status, security recommendations, and key security controls.
+
+#### Overview
+The following subsections detail the security posture, controls, and compliance status of the environment.
+""")
+
+    # Add Defender for Cloud Status
+    sections.append("### Microsoft Defender for Cloud Status\n")
+    defender_status = _get_defender_status(subscription_data)
+    sections.append(defender_status if defender_status else "_Microsoft Defender status information not available._\n")
+
+    # Add Security Recommendations
+    sections.append("\n### Security Recommendations\n")
+    security_recs = _get_security_recs_table(subscription_data)
+    sections.append(security_recs if security_recs else "_No security recommendations found._\n")
+
+    # Add Key Vault Security
+    sections.append("\n### Key Vault Security\n")
+    kv_access = _get_key_vault_access_model(subscription_data)
+    sections.append(kv_access if kv_access else "_No Key Vault access information available._\n")
+
+    # Add Sentinel Status
+    sections.append("\n### Microsoft Sentinel Status\n")
+    sentinel_status = _get_sentinel_status(subscription_data)
+    sections.append(sentinel_status if sentinel_status else "_Microsoft Sentinel status information not available._\n")
+
+    # Add Identity Security
+    sections.append("\n### Identity Security\n")
+    
+    sections.append("#### Privileged Access Management\n")
+    pim_status = _analyze_pim_status(subscription_data)
+    sections.append(pim_status if pim_status else "_No PIM information available._\n")
+    
+    sections.append("\n#### Service Principal Security\n")
+    sp_analysis = _analyze_service_principals(subscription_data)
+    sections.append(sp_analysis if sp_analysis else "_No service principal analysis available._\n")
+
+    # Add Network Security
+    sections.append("\n### Network Security\n")
+    
+    # Add Firewall Summary
+    sections.append("#### Firewall Configuration\n")
+    fw_table = _get_firewalls_table(subscription_data)
+    sections.append(fw_table if fw_table else "_No Azure Firewalls found._\n")
+    
+    # Add WAF Summary
+    sections.append("\n#### Web Application Firewall (WAF)\n")
+    waf_summary = _get_waf_summary(subscription_data)
+    sections.append(waf_summary if waf_summary else "_No WAF policies found._\n")
+    
+    # Add DDoS Protection
+    sections.append("\n#### DDoS Protection\n")
+    ddos_table = _get_ddos_table(subscription_data)
+    sections.append(ddos_table if ddos_table else "_No DDoS protection plans found._\n")
+
+    # Add Encryption Strategy
+    sections.append("\n### Encryption Strategy\n")
+    encryption_summary = _get_encryption_strategy_summary(subscription_data)
+    sections.append(encryption_summary if encryption_summary else "_No encryption strategy information available._\n")
+
+    return "\n".join(sections)

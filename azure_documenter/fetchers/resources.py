@@ -1,9 +1,10 @@
 import logging
+import asyncio # Import asyncio
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.web import WebSiteManagementClient
 from azure.core.exceptions import HttpResponseError
 
-def fetch_resources(credential, subscription_id):
+async def fetch_resources(credential, subscription_id):
     """Fetches basic details for all resources in a subscription."""
     logging.info(f"[{subscription_id}] Fetching resources...")
     resources_list = []
@@ -33,7 +34,7 @@ def fetch_resources(credential, subscription_id):
         #      logging.error(f"[{subscription_id}] Unexpected error fetching resources: {e}")
         return [] 
 
-def fetch_app_service_details(credential, subscription_id, resource_group_name, app_name):
+async def fetch_app_service_details(credential, subscription_id, resource_group_name, app_name):
     """Fetches detailed configuration for a specific App Service."""
     logging.info(f"[{subscription_id}] Fetching details for App Service '{app_name}' in RG '{resource_group_name}'...")
     app_details = {

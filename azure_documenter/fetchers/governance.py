@@ -1,25 +1,64 @@
 import logging
+import asyncio # Import asyncio
 # Use PolicyClient for assignments
 from azure.mgmt.resource.policy import PolicyClient
 from azure.mgmt.policyinsights import PolicyInsightsClient
 from azure.mgmt.advisor import AdvisorManagementClient
+from azure.mgmt.managementgroups import ManagementGroupsAPI
 from azure.core.exceptions import HttpResponseError
 from azure.mgmt.policyinsights.models import QueryOptions
 
-def fetch_governance_details(credential, subscription_id):
-    """Fetches Policy assignments, compliance states, and Advisor recommendations."""
+# New function to fetch Management Groups (tenant level)
+async def fetch_management_groups(credential):
+    """Fetches Management Groups for the tenant."""
+    logging.info("Fetching Management Groups...")
+    management_groups_data = []
+    try:
+        # Client doesn't take subscription_id for tenant-level operations
+        mg_client = ManagementGroupsAPI(credential)
+        groups = list(mg_client.management_groups.list())
+        logging.info(f"Found {len(groups)} management groups.")
+        for group in groups:
+            details = mg_client.management_groups.get(group.name, expand="children")
+            management_groups_data.append({
+                "id": details.id,
+                "name": details.name,
+                "type": details.type,
+                "display_name": details.display_name,
+                "tenant_id": details.tenant_id,
+                "parent": details.details.parent.id if details.details and details.details.parent else None,
+                "children": [
+                    {"id": child.id, "name": child.name, "type": child.type, "display_name": child.display_name}
+                    for child in details.children
+                ] if details.children else []
+            })
+    except HttpResponseError as e:
+        logging.warning(f"Could not list Management Groups (Check Tenant Permissions?): {e.message}")
+    except Exception as e:
+        logging.error(f"Unexpected error fetching Management Groups: {e}")
+    logging.info("Finished fetching Management Groups.")
+    return management_groups_data
+
+async def fetch_governance_details(credential, subscription_id):
+    """Fetches Policy assignments, definitions, compliance states, and Advisor recommendations."""
     logging.info(f"[{subscription_id}] Fetching governance details (Policy, Advisor)...")
     governance_data = {
         "policy_assignments": [],
+        "policy_definitions": [],
         "policy_states": [],
         "advisor_recommendations": []
     }
+    policy_client = None
+    try:
+        # Use PolicyClient instead of ResourceManagementClient for assignments & definitions
+        policy_client = PolicyClient(credential, subscription_id)
+    except Exception as e:
+        logging.error(f"[{subscription_id}] Failed to initialize PolicyClient: {e}")
+        # Return early if client fails to initialize
+        return governance_data
 
     # Fetch Policy Assignments
     try:
-        # Use PolicyClient instead of ResourceManagementClient for assignments
-        policy_client = PolicyClient(credential, subscription_id)
-        # Try using list() - maybe it implicitly uses the client's subscription scope?
         assignments = list(policy_client.policy_assignments.list())
         logging.info(f"[{subscription_id}] Found {len(assignments)} policy assignments at subscription scope.")
         for assign in assignments:
@@ -34,6 +73,24 @@ def fetch_governance_details(credential, subscription_id):
         logging.warning(f"[{subscription_id}] Could not list Policy Assignments (Check Permissions?): {e.message}")
     except Exception as e:
         logging.error(f"[{subscription_id}] Unexpected error fetching Policy Assignments: {e}")
+
+    # Fetch Policy Definitions (Subscription scope)
+    try:
+        definitions = list(policy_client.policy_definitions.list())
+        logging.info(f"[{subscription_id}] Found {len(definitions)} policy definitions at subscription scope.")
+        for definition in definitions:
+            governance_data["policy_definitions"].append({
+                "id": definition.id,
+                "name": definition.name,
+                "policy_type": str(definition.policy_type),
+                "display_name": definition.display_name,
+                "description": definition.description,
+                "mode": definition.mode,
+            })
+    except HttpResponseError as e:
+        logging.warning(f"[{subscription_id}] Could not list Policy Definitions: {e.message}")
+    except Exception as e:
+        logging.error(f"[{subscription_id}] Unexpected error fetching Policy Definitions: {e}")
 
     # Fetch Policy Compliance States
     try:
@@ -66,7 +123,6 @@ def fetch_governance_details(credential, subscription_id):
                 "resource_group": state.resource_group,
                 "policy_assignment_name": state.policy_assignment_name,
                 "policy_definition_name": state.policy_definition_name,
-                # Add more fields as needed, e.g., state.policy_set_definition_id
             })
 
     except HttpResponseError as e:
@@ -88,15 +144,14 @@ def fetch_governance_details(credential, subscription_id):
             governance_data["advisor_recommendations"].append({
                 "id": rec.id,
                 "name": rec.name,
-                "category": str(rec.category), # Enum
-                "impact": str(rec.impact), # Enum
+                "category": str(rec.category),
+                "impact": str(rec.impact),
                 "impacted_field": rec.impacted_field,
                 "impacted_value": rec.impacted_value,
                 "last_updated": rec.last_updated,
                 "recommendation_type_id": rec.recommendation_type_id,
                 "short_description": rec.short_description.problem if rec.short_description else None,
-                "resource_metadata": rec.resource_metadata.__dict__ if rec.resource_metadata else None # Capture resource target
-                # Add extended properties if needed: rec.extended_properties
+                "resource_metadata": rec.resource_metadata.__dict__ if rec.resource_metadata else None
             })
     except HttpResponseError as e:
         if e.status_code == 403:
