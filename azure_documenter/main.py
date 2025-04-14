@@ -460,6 +460,14 @@ async def main():
     
     # Set global silent mode flag
     SILENT_MODE = args.silent
+
+    # Create all output directories at startup
+    os.makedirs(OUTPUT_BASE_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    os.makedirs(DIAGRAM_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(VERSION_TRACKING_DIR, exist_ok=True)
     
     # --- Configure Logging for Silent Mode ---
     if SILENT_MODE:

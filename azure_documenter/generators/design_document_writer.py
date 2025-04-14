@@ -317,60 +317,55 @@ def _get_firewalls_table(all_data):
     return _generate_markdown_table(headers, sorted(rows, key=lambda x: (x[0], x[1])))
 
 def _get_dns_details(all_data):
-    """Generates Markdown lists for Private DNS Zones and Custom VNet DNS."""
-    private_zones_text = []
-    custom_dns_text = []
-    unique_custom_dns = set()
-    zones_by_type = {}  # Track zone types for summary
-
+    """Analyzes DNS configuration across subscriptions."""
+    private_dns_zones = []
+    custom_dns_servers = []
+    
     for sub_id, data in all_data.items():
-        if "error" in data or "networking" not in data: continue
-        sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        private_zones = data["networking"].get("private_dns_zones", [])
-        for zone in private_zones:
-             if isinstance(zone, dict):
-                zone_name = zone.get('name', 'Unknown')
-                links = zone.get('vnet_links', [])
-                links_str = ", ".join(links) if links else "None"
-                private_zones_text.append(f"- **{zone_name}** (Sub: {sub_name}): Linked to VNets: {links_str}")
-                
-                # Track zone types for summary
-                zone_type = zone_name.split('.', 1)[1] if '.' in zone_name else 'Other'
-                zones_by_type[zone_type] = zones_by_type.get(zone_type, 0) + 1
-                
-             else: logging.warning(f"Skipping non-dictionary private zone in sub {sub_id}: {zone}")
+        if "error" in data:
+            continue
+            
+        networking = data.get("networking", {})
         
-        vnets = data["networking"].get("vnets", [])
+        # Check for private DNS zones
+        zones = networking.get("private_dns_zones", [])
+        if zones:
+            private_dns_zones.extend(zones)
+            
+        # Check VNets for custom DNS
+        vnets = networking.get("vnets", [])
         for vnet in vnets:
-            if isinstance(vnet, dict):
-                dns_servers = vnet.get("custom_dns_servers", [])
-                if dns_servers:
-                    vnet_name = vnet.get("name", "Unknown")
-                    dns_list = ", ".join(dns_servers)
-                    custom_dns_text.append(f"- VNet **{vnet_name}** (Sub: {sub_name}): `{dns_list}`")
-                    unique_custom_dns.update(dns_servers)
-            else: logging.warning(f"Skipping non-dictionary vnet for DNS check in sub {sub_id}: {vnet}")
+            if vnet.get("dns_servers"):
+                custom_dns_servers.append({
+                    "vnet_name": vnet.get("name"),
+                    "dns_servers": vnet.get("dns_servers"),
+                    "subscription": data.get("subscription_info", {}).get("display_name", sub_id)
+                })
     
-    # Generate the output with context
-    if private_zones_text:
-        zones_summary = "\n\n**Private DNS Zones Summary:**"
-        zones_summary += f"\n- Total Zones: {len(private_zones_text)}"
-        if zones_by_type:
-            zones_summary += "\n- Zone Types:"
-            for zone_type, count in sorted(zones_by_type.items()):
-                zones_summary += f"\n  - {zone_type}: {count} zone(s)"
-        private_zones_output = "\n".join(sorted(private_zones_text)) + zones_summary
+    sections = ["\n### DNS Configuration"]
+    
+    # Private DNS Zones
+    sections.append("\n**Private DNS Zones:**")
+    if private_dns_zones:
+        sections.append("\n| Zone Name | Resource Group | Subscription |")
+        sections.append("|-----------|----------------|--------------|")
+        for zone in private_dns_zones:
+            sections.append(f"| {zone.get('name', 'N/A')} | {zone.get('resource_group', 'N/A')} | {zone.get('subscription_name', 'N/A')} |")
     else:
-        private_zones_output = "_No Azure Private DNS Zones found. This is expected if you're not using Azure Private Link or if private endpoints are not required for your workload._"
+        sections.append("\nNo Azure Private DNS Zones found. This is expected if you're not using Azure Private Link or if private endpoints are not required for your workload.")
     
-    if custom_dns_text:
-        custom_dns_output = "\n".join(sorted(custom_dns_text))
-        if unique_custom_dns:
-            custom_dns_output += f"\n\n**Unique DNS Servers:** {', '.join(sorted(unique_custom_dns))}"
+    # Custom DNS Servers
+    sections.append("\n**VNets Using Custom DNS Servers:**")
+    if custom_dns_servers:
+        sections.append("\n| VNet Name | DNS Servers | Subscription |")
+        sections.append("|-----------|-------------|--------------|")
+        for entry in custom_dns_servers:
+            dns_servers_str = ", ".join(entry.get("dns_servers", []))
+            sections.append(f"| {entry.get('vnet_name', 'N/A')} | {dns_servers_str} | {entry.get('subscription', 'N/A')} |")
     else:
-        custom_dns_output = "_No VNets found using Custom DNS Servers. This is expected if you're using Azure-provided DNS or Private DNS Zones exclusively._"
+        sections.append("\nNo VNets found using Custom DNS Servers. This is expected if you're using Azure-provided DNS or Private DNS Zones exclusively.")
     
-    return private_zones_output, custom_dns_output
+    return "\n".join(sections)
 
 def _get_ddos_table(all_data):
     """Generates Markdown table for DDoS Protection Plans."""
@@ -993,76 +988,81 @@ def _get_landing_zone_examples(all_data, max_examples=3, max_resources_per_lz=5)
 
 # --- Placeholder Content Helpers ---
 
-def _analyze_network_topology(all_data):
-    """
-    Analyzes the network topology across all subscriptions.
-    Returns a string containing the analysis in markdown format.
-    """
+def _analyze_network_topology(all_data, diagram_paths=None):
+    """Analyzes and summarizes network topology across all subscriptions."""
     sections = []
     
-    try:
-        # Add overview section
-        sections.append("""
-### Network Topology Overview
-This section provides an analysis of the network architecture across all subscriptions, including VNets, peering, connectivity, and security components.
+    # Add tenant-wide diagram if available
+    sections.append("\n### Tenant-Wide Network Topology")
+    if diagram_paths and "tenant_diagrams" in diagram_paths and "network_topology" in diagram_paths["tenant_diagrams"]:
+        tenant_diagram = f"../diagrams/{diagram_paths['tenant_diagrams']['network_topology']}"
+        tenant_diagram = tenant_diagram.replace("\\", "/")
+        sections.append(f'<img src="{tenant_diagram}" alt="Tenant Network Topology" style="max-width: 100%; height: auto;"/>')
+        sections.append("\n_This diagram shows all Virtual Networks across subscriptions and their peering relationships._\n")
+    else:
+        sections.append("_No tenant-wide network diagram available._")
+
+    # Add overview section
+    sections.append("""
+### Network Overview
+This section provides a comprehensive view of the networking configuration across all subscriptions,
+including Virtual Networks (VNets), peering relationships, and network security components.
 """)
 
-        # Add VNets table
-        sections.append("### Virtual Networks\n")
-        vnets_table = _get_vnets_table(all_data)
-        sections.append(vnets_table if vnets_table else "_No Virtual Networks found._\n")
+    # Get VNets table
+    vnets_table = _get_vnets_table(all_data)
+    if vnets_table:
+        sections.append("\n#### Virtual Networks")
+        sections.append(vnets_table)
 
-        # Add Peering information
-        sections.append("\n### VNet Peering\n")
-        peering_table = _get_peering_table(all_data)
-        sections.append(peering_table if peering_table else "_No VNet peering configurations found._\n")
+    # Get Peering table
+    peering_table = _get_peering_table(all_data)
+    if peering_table:
+        sections.append("\n#### VNet Peering Relationships")
+        sections.append(peering_table)
 
-        # Add Gateway information
-        sections.append("\n### Network Gateways\n")
-        gateways_table = _get_gateways_table(all_data)
-        sections.append(gateways_table if gateways_table else "_No network gateways found._\n")
+    # Get Gateways table
+    gateways_table = _get_gateways_table(all_data)
+    if gateways_table:
+        sections.append("\n#### Network Gateways")
+        sections.append(gateways_table)
 
-        # Add Firewall information
-        sections.append("\n### Azure Firewalls\n")
-        firewalls_table = _get_firewalls_table(all_data)
-        sections.append(firewalls_table if firewalls_table else "_No Azure Firewalls found._\n")
+    # Get Firewalls table
+    firewalls_table = _get_firewalls_table(all_data)
+    if firewalls_table:
+        sections.append("\n#### Azure Firewalls")
+        sections.append(firewalls_table)
 
-        # Add DNS information
-        sections.append("\n### DNS Configuration\n")
-        dns_details = _get_dns_details(all_data)
-        sections.append(dns_details if dns_details else "_No DNS configurations found._\n")
+    # Get DNS details
+    dns_details = _get_dns_details(all_data)
+    if dns_details:
+        sections.append(dns_details)
 
-        # Add Private Endpoints
-        sections.append("\n### Private Endpoints\n")
-        private_endpoints = _get_private_endpoints_table(all_data)
-        sections.append(private_endpoints if private_endpoints else "_No private endpoints found._\n")
+    # Get DDoS Protection table
+    ddos_table = _get_ddos_table(all_data)
+    if ddos_table:
+        sections.append("\n#### DDoS Protection")
+        sections.append(ddos_table)
 
-        # Add Internet Ingress Points
-        sections.append("\n### Internet Ingress Points\n")
-        ingress_list = _get_internet_ingress_list(all_data)
-        sections.append(ingress_list if ingress_list else "_No internet ingress points identified._\n")
+    # Get Private Endpoints table
+    private_endpoints_table = _get_private_endpoints_table(all_data)
+    if private_endpoints_table:
+        sections.append("\n#### Private Endpoints")
+        sections.append(private_endpoints_table)
 
-        # Add Internet Egress Analysis
-        sections.append("\n### Internet Egress Analysis\n")
-        egress_analysis = _analyze_internet_egress(all_data)
-        sections.append(egress_analysis if egress_analysis else "_No internet egress analysis available._\n")
+    # Get Internet Ingress points
+    internet_ingress = _get_internet_ingress_list(all_data)
+    if internet_ingress:
+        sections.append("\n#### Internet Ingress Points")
+        sections.append(internet_ingress)
 
-        # Add Service Endpoints Summary
-        sections.append("\n### Service Endpoints\n")
-        endpoints_summary = _get_service_endpoints_summary(all_data)
-        sections.append(endpoints_summary if endpoints_summary else "_No service endpoints configured._\n")
+    # Get WAF summary
+    waf_summary = _get_waf_summary(all_data)
+    if waf_summary:
+        sections.append("\n#### Web Application Firewall (WAF) Usage")
+        sections.append(waf_summary)
 
-        # Add Private Link Services
-        sections.append("\n### Private Link Services\n")
-        private_links = _get_private_link_services_table(all_data)
-        sections.append(private_links if private_links else "_No private link services found._\n")
-
-        # Convert all sections to strings and join
-        return "\n".join([str(section) for section in sections if section is not None])
-
-    except Exception as e:
-        logging.error(f"Error in network topology analysis: {str(e)}")
-        return "_Error analyzing network topology._"
+    return "\n".join(sections)
 
 def _analyze_internet_egress(all_data):
     """Basic heuristic for Internet Egress path."""
@@ -2468,6 +2468,17 @@ def generate_design_document(subscription_data, output_dir, tenant_name, tenant_
         return None
 
     try:
+        # Ensure we're using the reports subdirectory
+        reports_dir = os.path.join(output_dir, "reports")
+        os.makedirs(reports_dir, exist_ok=True)
+        
+        # Clean tenant name for filename
+        clean_tenant_name = tenant_name.replace(" ", "_").replace("/", "_").replace("\\", "_")
+        
+        # Create output filename
+        output_filename = f"Azure_Design_Document_{clean_tenant_name}_{timestamp_str}_v{version:.1f}.md"
+        output_file = os.path.join(reports_dir, output_filename)
+        
         # Initialize sections list
         doc_sections = []
 
@@ -2502,10 +2513,10 @@ This document provides a comprehensive overview of the Azure environment for ten
             "content": _analyze_rg_naming_patterns(subscription_data)
         })
 
-        # Add Network Architecture
+        # Add Network Architecture with diagram paths
         doc_sections.append({
             "title": "Network Architecture",
-            "content": _analyze_network_topology(subscription_data)
+            "content": _analyze_network_topology(subscription_data, diagram_paths)
         })
 
         # Add Network Diagrams if available
@@ -2578,11 +2589,6 @@ The following subsections detail the AI and Machine Learning services currently 
             markdown_content.append("\n\n")  # Add spacing between sections
 
         # Write to file
-        os.makedirs(output_dir, exist_ok=True)
-        # Create a clean tenant name for the filename (replace spaces and special chars)
-        clean_tenant_name = tenant_name.replace(" ", "_").replace("/", "_").replace("\\", "_")
-        output_file = os.path.join(output_dir, f"Azure_Design_Document_{clean_tenant_name}_{timestamp_str}_v{version:.1f}.md")
-        
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write("\n".join(markdown_content))
         
@@ -2902,28 +2908,46 @@ def _get_data_sovereignty_analysis(all_data):
     return f"Resources primarily located in: {', '.join(primary_regions)}. Ensure these align with data sovereignty requirements."
 
 def _get_subscription_costs_table(all_data):
-    """Generates Markdown table for subscription costs."""
-    headers = ["Subscription", "MTD Cost", "YTD Cost", "Forecast (30d)", "Currency"]
-    rows = []
+    """Generates a table of subscription costs."""
+    sections = []
+    sections.append("\n### Cost Analysis")
+    
+    # Extract currency from first available subscription
+    currency = None
+    for data in all_data.values():
+        if "costs" in data and isinstance(data["costs"], dict):
+            currency = data["costs"].get("currency", "")
+            if currency:
+                break
+    
+    currency_display = f" ({currency})" if currency else ""
+    
+    sections.append("\n**Monthly Cost by Subscription**")
+    sections.append(f"\n| Subscription | Current Month Cost{currency_display} | Previous Month Cost{currency_display} |")
+    sections.append("|--------------|-------------------|---------------------|")
+    
+    total_current = 0
+    total_previous = 0
     
     for sub_id, data in all_data.items():
-        if "error" in data or "costs" not in data:
+        if "error" in data:
             continue
             
-        costs = data.get("costs", {})
         sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-        currency = costs.get("currency", "N/A")
+        costs = data.get("costs", {})
         
-        mtd_cost = f"{costs.get('mtd_actual_cost', 'N/A'):,.2f}" if costs.get('mtd_actual_cost') is not None else "N/A"
-        ytd_cost = f"{costs.get('ytd_actual_cost', 'N/A'):,.2f}" if costs.get('ytd_actual_cost') is not None else "N/A"
-        forecast = f"{costs.get('forecast_cost', 'N/A'):,.2f}" if costs.get('forecast_cost') is not None else "N/A"
+        current_cost = costs.get("mtd_actual_cost", 0)
+        previous_cost = costs.get("previous_month_cost", 0)
         
-        rows.append([sub_name, mtd_cost, ytd_cost, forecast, currency])
+        total_current += current_cost if isinstance(current_cost, (int, float)) else 0
+        total_previous += previous_cost if isinstance(previous_cost, (int, float)) else 0
+        
+        sections.append(f"| {sub_name} | {current_cost:.2f} | {previous_cost:.2f} |")
     
-    if not rows:
-        return "_No cost data available. This may be due to insufficient permissions or no cost data for the current period._"
+    # Add totals row
+    sections.append(f"| **Total** | **{total_current:.2f}** | **{total_previous:.2f}** |")
     
-    return _generate_markdown_table(headers, sorted(rows, key=lambda x: float(x[1].replace(',', '')) if x[1] != 'N/A' else 0, reverse=True))
+    return "\n".join(sections)
 
 def _get_resource_type_costs(all_data):
     """Analyzes and summarizes costs by resource type."""
