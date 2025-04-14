@@ -770,11 +770,16 @@ def export_markdown_to_html(markdown_filepath, output_report_dir, tenant_display
     # Construct timestamped HTML filename
     time_suffix = f"_{timestamp_str}" if timestamp_str else ""
     markdown_basename = os.path.basename(markdown_filepath)
-    # Derive base name for title etc. (e.g., Azure_Design_Document from Azure_Design_Document_2025...) 
-    base_name_match = re.match(r"^(.*?)(_\d{8}_\d{6})?(\.md)$", markdown_basename, re.IGNORECASE)
-    report_base_name = base_name_match.group(1) if base_name_match else "Report"
     
-    html_filename = f"{report_base_name}{time_suffix}.html"
+    # Create a clean tenant name for the filename
+    clean_tenant_name = tenant_display_name.replace(" ", "_").replace("/", "_").replace("\\", "_")
+    
+    # Extract version from markdown filename if present, otherwise use provided version
+    version_match = re.search(r"_v(\d+\.\d+)\.md$", markdown_basename)
+    version_str = version_match.group(1) if version_match else f"{document_version:.1f}"
+    
+    # Construct HTML filename with the same pattern as markdown
+    html_filename = f"Azure_Design_Document_{clean_tenant_name}_{timestamp_str}_v{version_str}.html"
     html_filepath = os.path.join(output_report_dir, html_filename)
 
     try:

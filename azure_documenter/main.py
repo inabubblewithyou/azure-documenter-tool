@@ -257,7 +257,16 @@ def select_subscriptions(subscriptions):
 def save_raw_data(data, filename_prefix, timestamp_str):
     """Saves the collected data to a timestamped JSON file."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    filename = f"{filename_prefix}_{timestamp_str}.json"
+    
+    # Get tenant name and version from the data
+    tenant_name = data.get("run_details", {}).get("tenant_display_name", "Unknown_Tenant")
+    version = data.get("run_details", {}).get("version", 0.0)
+    
+    # Clean tenant name for filename
+    clean_tenant_name = tenant_name.replace(" ", "_").replace("/", "_").replace("\\", "_")
+    
+    # Construct filename with tenant name and version
+    filename = f"{filename_prefix}_{clean_tenant_name}_{timestamp_str}_v{version:.1f}.json"
     filepath = os.path.join(DATA_DIR, filename)
     try:
         with open(filepath, 'w') as f:
@@ -446,6 +455,7 @@ async def main():
     parser.add_argument("--compare", nargs=2, metavar=("TIMESTAMP1", "TIMESTAMP2"), help="Compare two previous audit runs using timestamps (YYYYMMDD_HHMMSS format). Used with --mode Compare.")
     parser.add_argument("--all-subscriptions", action="store_true", help="Audit all accessible subscriptions without interactive selection.")
     parser.add_argument("--silent", "-s", action="store_true", help="Run in silent mode (suppress console output, but still log to file).")
+    parser.add_argument("--llm", action="store_true", help="Enable LLM-enhanced report generation in Design mode.")
     args = parser.parse_args()
     
     # Set global silent mode flag
@@ -647,6 +657,15 @@ Run ID: [cyan]{run_timestamp}[/cyan]""",
      }
     # --------------------------------------------------------------
 
+    # Add version to each subscription's data for diagrams
+    version = get_next_version(tenant_id)
+    for sub_id, data in all_subscription_data.items():
+        if isinstance(data, dict):
+            data["run_details"] = data.get("run_details", {})
+            data["run_details"]["version"] = version
+            data["subscription_info"] = data.get("subscription_info", {})
+            data["subscription_info"]["tenant_display_name"] = processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant")
+
     # --- Save Raw Audit Data (JSON) ---
     raw_data_filepath = save_raw_data(final_audit_data_to_save, "azure_audit_raw_data", run_timestamp)
 
@@ -657,8 +676,23 @@ Run ID: [cyan]{run_timestamp}[/cyan]""",
     # Generate Diagrams 
     if not SILENT_MODE: rprint("  Generating network diagrams...")
     logging.info("Generating diagrams...")
+    
+    # Ensure diagram directory exists and is absolute
+    diagram_dir = os.path.abspath(DIAGRAM_DIR)
+    os.makedirs(diagram_dir, exist_ok=True)
+    logging.info(f"Using diagram directory: {diagram_dir}")
+    
     # Pass the subscription data dict directly
-    generated_diagram_paths = generate_all_diagrams(all_subscription_data, DIAGRAM_DIR, run_timestamp)
+    generated_diagram_paths = generate_all_diagrams(all_subscription_data, diagram_dir, run_timestamp)
+    
+    if generated_diagram_paths:
+        logging.info("Generated diagrams:")
+        if "tenant_diagrams" in generated_diagram_paths:
+            logging.info(f"Tenant diagrams: {generated_diagram_paths['tenant_diagrams']}")
+        if "subscription_diagrams" in generated_diagram_paths:
+            logging.info(f"Subscription diagrams: {generated_diagram_paths['subscription_diagrams']}")
+    else:
+        logging.warning("No diagrams were generated")
 
     # --- Generate Markdown Report (Audit or Design) ---
     generated_report_path = None 
@@ -670,12 +704,18 @@ Run ID: [cyan]{run_timestamp}[/cyan]""",
             OUTPUT_BASE_DIR,
             processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant"),
             processed_tenant_results.get("tenant_details", {}).get("default_domain", "unknown.onmicrosoft.com"),
-            get_next_version(tenant_id),
+            version, # Use the same version we used for diagrams
             management_group_data=processed_tenant_results.get("management_groups", []), # Pass MG data separately
             diagram_paths=generated_diagram_paths,
             timestamp_str=run_timestamp,
             silent_mode=SILENT_MODE
         )
+        
+        # Apply LLM enhancements if enabled
+        if args.llm and generated_report_path:
+            if not SILENT_MODE: rprint("  Enhancing document with LLM analysis...")
+            logging.info("Applying LLM enhancements to design document...")
+            enhance_report_with_llm(all_subscription_data, generated_report_path)
     else: # Default to Audit mode
         if not SILENT_MODE: rprint(f"  Generating [bold]{args.mode}[/bold] report...")
         logging.info("Generating audit report...")

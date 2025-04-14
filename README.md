@@ -82,6 +82,7 @@ A powerful automated tool that audits and documents Azure infrastructure across 
   - Automatically versioned
   - Executive summary
   - Detailed technical appendices
+  - Optional AI-enhanced analysis with `--llm` flag
 
 * **Audit Report**
   - Detailed technical findings
@@ -154,6 +155,9 @@ python azure_documenter/main.py
 # Design document mode
 python azure_documenter/main.py --mode Design
 
+# Design document with AI-enhanced analysis
+python azure_documenter/main.py --mode Design --llm
+
 # All subscriptions
 python azure_documenter/main.py --all-subscriptions
 
@@ -181,6 +185,18 @@ outputs/
 * Subscription Scope: Interactive or all subscriptions
 * Output Control: Normal or silent mode
 * Logging: Console (INFO) and File (DEBUG)
+* LLM Integration: Configure via environment variables:
+  ```env
+  # For Azure OpenAI:
+  LLM_PROVIDER=AZURE_OPENAI
+  AZURE_OPENAI_API_KEY=your_api_key
+  AZURE_OPENAI_ENDPOINT=your_endpoint
+  AZURE_OPENAI_DEPLOYMENT=your_deployment_name
+
+  # Or for OpenAI:
+  LLM_PROVIDER=OPENAI
+  OPENAI_API_KEY=your_api_key
+  ```
 
 ## Documentation
 

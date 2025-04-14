@@ -6,6 +6,8 @@ def generate_vnet_diagram(subscription_data, diagram_output_path, timestamp_str)
     """Generates a timestamped VNet/Subnet diagram for a single subscription using Graphviz."""
     sub_id = subscription_data.get("subscription_info", {}).get("id", "unknown_sub")
     sub_display_name = subscription_data.get("subscription_info", {}).get("display_name", sub_id)
+    tenant_name = subscription_data.get("subscription_info", {}).get("tenant_display_name", "Unknown_Tenant")
+    version = subscription_data.get("run_details", {}).get("version", 0.0)
     networking_data = subscription_data.get("networking", {})
     vnets = networking_data.get("vnets", [])
     subnets = networking_data.get("subnets", [])
@@ -16,11 +18,17 @@ def generate_vnet_diagram(subscription_data, diagram_output_path, timestamp_str)
 
     logging.info(f"[{sub_id}] Generating VNet diagram...")
 
+    # Clean tenant name for filename
+    clean_tenant_name = tenant_name.replace(" ", "_").replace("/", "_").replace("\\", "_")
     safe_sub_name = "".join(c for c in sub_display_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
-    # Add timestamp to filename
-    filename_base = f"vnet_topology_{safe_sub_name}_{sub_id}_{timestamp_str}"
+    
+    # Add timestamp and version to filename
+    filename_base = f"vnet_topology_{clean_tenant_name}_{safe_sub_name}_{sub_id}_{timestamp_str}_v{version:.1f}"
     filename_gv = f"{filename_base}.gv"
+    filename_png = f"{filename_base}.png"
+    
     output_filepath_gv = os.path.join(diagram_output_path, filename_gv)
+    output_filepath_png = os.path.join(diagram_output_path, filename_png)
 
     # Create a Graphviz Digraph
     # Using subgraph for each VNet to group subnets visually
@@ -104,8 +112,8 @@ def generate_vnet_diagram(subscription_data, diagram_output_path, timestamp_str)
         rendered_path = dot.render(filename_base, directory=diagram_output_path, format=output_format, cleanup=True, view=False) # cleanup removes the .gv source, view=False prevents opening
 
         logging.info(f"[{sub_id}] Successfully generated VNet diagram: {rendered_path}")
-        # Return ONLY the filename
-        return os.path.basename(rendered_path)
+        # Return the PNG filename (not full path) for document inclusion
+        return filename_png
 
     except Exception as e:
         logging.error(f"[{sub_id}] Failed to generate VNet diagram: {e}")
@@ -119,22 +127,28 @@ def generate_vnet_diagram(subscription_data, diagram_output_path, timestamp_str)
             logging.error(f"[{sub_id}] Error cleaning up failed diagram files: {rm_err}")
         return None
 
-def generate_tenant_network_diagram(all_data, diagram_output_path, timestamp_str):
+def generate_tenant_network_diagram(all_data, diagram_output_path, timestamp_str, version):
     """Generates a tenant-wide network diagram showing all VNets and peerings across subscriptions."""
     logging.info("Generating tenant-wide network diagram...")
     
     # Try to determine tenant name from subscription data
-    tenant_name = "Azure Tenant"
-    # Look for tenant_domain in any subscription if available
-    for sub_id, sub_data in all_data.items():
-        if "subscription_info" in sub_data and "tenant_domain" in sub_data["subscription_info"]:
-            tenant_name = sub_data["subscription_info"]["tenant_domain"]
+    tenant_name = "Unknown_Tenant"
+    # Look for tenant info in any subscription
+    for sub_id, data in all_data.items():
+        if "subscription_info" in data and "tenant_display_name" in data["subscription_info"]:
+            tenant_name = data["subscription_info"]["tenant_display_name"]
             break
     
-    # Create output filename
-    filename_base = f"tenant_network_topology_{timestamp_str}"
+    # Clean tenant name for filename
+    clean_tenant_name = tenant_name.replace(" ", "_").replace("/", "_").replace("\\", "_")
+    
+    # Create output filename with tenant name, timestamp and version
+    filename_base = f"tenant_network_topology_{clean_tenant_name}_{timestamp_str}_v{version:.1f}"
     filename_gv = f"{filename_base}.gv"
+    filename_png = f"{filename_base}.png"
+    
     output_filepath_gv = os.path.join(diagram_output_path, filename_gv)
+    output_filepath_png = os.path.join(diagram_output_path, filename_png)
     
     # Create a Graphviz Digraph for the tenant
     dot = graphviz.Digraph(name='tenant_network_topology', 
@@ -309,8 +323,8 @@ def generate_tenant_network_diagram(all_data, diagram_output_path, timestamp_str
         rendered_path = dot.render(filename_base, directory=diagram_output_path, format=output_format, cleanup=True, view=False)
         
         logging.info(f"Tenant-wide network diagram generated: {rendered_path}")
-        # Return ONLY the filename
-        return os.path.basename(rendered_path)
+        # Return the PNG filename (not full path) for document inclusion
+        return filename_png
             
     except Exception as e:
         logging.error(f"Failed to generate tenant-wide network diagram: {e}")
@@ -324,30 +338,54 @@ def generate_tenant_network_diagram(all_data, diagram_output_path, timestamp_str
             logging.error(f"Error cleaning up failed diagram files: {rm_err}")
         return None
 
-# Add a main function to call the diagram generator for all subscriptions later
 def generate_all_diagrams(all_data, diagram_output_path, timestamp_str):
-    """Generates timestamped diagrams for all subscriptions."""
+    """Generates all network diagrams for the environment."""
+    logging.info("Starting diagram generation...")
+    
+    # Ensure diagram directory exists and is absolute
+    # Create diagrams directory under outputs
+    base_output_dir = os.path.dirname(os.path.dirname(diagram_output_path))  # Go up two levels to get base output dir
+    diagram_dir = os.path.join(base_output_dir, "outputs", "diagrams")
+    diagram_dir = os.path.abspath(diagram_dir)
+    os.makedirs(diagram_dir, exist_ok=True)
+    logging.info(f"Using diagram directory: {diagram_dir}")
+    
+    # Initialize return structure
     generated_diagrams = {
         "subscription_diagrams": {},
         "tenant_diagrams": {}
     }
-    
-    logging.info(f"Starting diagram generation for all subscriptions (Run ID: {timestamp_str})...")
-    
-    # Generate per-subscription diagrams
+
+    # Get version from run_details (should be same across all subs)
+    version = 0.0
+    for sub_id, data in all_data.items():
+        if isinstance(data, dict) and "run_details" in data:
+            version = data["run_details"].get("version", 0.0)
+            break
+
+    logging.info(f"Generating diagrams with version {version}")
+
+    # Generate subscription-specific diagrams
     for sub_id, data in all_data.items():
         if "error" not in data and "networking" in data and data["networking"].get("vnets"):
-            diagram_rel_path = generate_vnet_diagram(data, diagram_output_path, timestamp_str)
+            # Add version to the data for diagram generation
+            data["run_details"] = data.get("run_details", {})
+            data["run_details"]["version"] = version
+            diagram_rel_path = generate_vnet_diagram(data, diagram_dir, timestamp_str)
             if diagram_rel_path:
+                # Store just the filename, not the full path
                 generated_diagrams["subscription_diagrams"][sub_id] = {"vnet_topology": diagram_rel_path}
+                logging.info(f"Generated subscription diagram: {diagram_rel_path}")
         else:
             sub_display_name = data.get("subscription_info", {}).get("display_name", sub_id)
             logging.info(f"Skipping diagram generation for {sub_display_name} ({sub_id}) due to error or no VNets.")
     
-    # Generate tenant-wide network diagram
-    tenant_diagram_path = generate_tenant_network_diagram(all_data, diagram_output_path, timestamp_str)
+    # Generate tenant-wide network diagram with version
+    tenant_diagram_path = generate_tenant_network_diagram(all_data, diagram_dir, timestamp_str, version)
     if tenant_diagram_path:
+        # Store just the filename, not the full path
         generated_diagrams["tenant_diagrams"]["network_topology"] = tenant_diagram_path
+        logging.info(f"Generated tenant diagram: {tenant_diagram_path}")
     
     logging.info("Finished all diagram generation.")
-    return generated_diagrams # Return dict with both subscription and tenant diagrams 
+    return generated_diagrams 

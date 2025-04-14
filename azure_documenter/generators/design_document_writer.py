@@ -1094,45 +1094,25 @@ def _analyze_nsg_summary():
      return "_NSG analysis (rule density, common open ports) requires dedicated analysis logic not yet implemented._"
 
 def _get_subscription_diagram_links(all_data, diagram_paths, report_path_dir):
-    """Generates list of links to subscription diagrams."""
-    links = []
-    diagram_dir_abs = os.path.abspath(os.path.join(report_path_dir, '../diagrams')) # Get absolute path to diagram dir
-
-    # Get the dictionary containing subscription diagrams
-    subscription_diagram_dict = diagram_paths.get("subscription_diagrams", {})
-
-    # Check for diagrams generated per subscription
-    for sub_id, data in all_data.items():
-         # Skip the special tenant_diagrams key if present (This shouldn't be in all_data, but good practice)
-         if sub_id == "tenant_diagrams": 
-             continue
-             
-         # Check if diagrams exist for this sub_id within the sub-dictionary
-         if sub_id in subscription_diagram_dict:
-             sub_name = data.get("subscription_info", {}).get("display_name", sub_id)
-             sub_diagrams = subscription_diagram_dict[sub_id] # Get diagrams from the sub-dictionary
-             if isinstance(sub_diagrams, dict):
-                 for key, diagram_filename in sub_diagrams.items(): # Expecting filename now
-                     if not diagram_filename or not isinstance(diagram_filename, str):
-                         logging.warning(f"Invalid diagram filename for {sub_name} - {key}: {diagram_filename}")
-                         continue
-                     
-                     # Construct absolute path to check existence
-                     full_diagram_path = os.path.join(diagram_dir_abs, diagram_filename)
-                         
-                     # Check if diagram file actually exists
-                     if os.path.exists(full_diagram_path):
-                        try:
-                            # Calculate relative path from report dir to diagram dir + filename
-                            relative_path = os.path.join("../diagrams", diagram_filename).replace("\\", "/")
-                            link_text = f"{sub_name} - {key.replace('_', ' ').title()}"
-                            links.append(f"- **{link_text}**:<br>![{link_text}]({relative_path})")
-                        except Exception as e:
-                             logging.warning(f"Could not calculate relative path for sub diagram {sub_name} - {key}: {e}")
-                     else:
-                         logging.warning(f"Subscription diagram file not found for {sub_name} at {full_diagram_path} (Filename: {diagram_filename})")
+    """Generates markdown links for subscription-specific diagrams."""
+    if not diagram_paths or "subscription_diagrams" not in diagram_paths:
+        logging.warning("No diagram paths provided for subscription diagrams")
+        return "_No subscription-specific diagrams available._"
     
-    return "\n".join(sorted(links)) if links else "_No subscription-specific diagrams found or paths provided._"
+    markdown = []
+    for sub_id, diagrams in diagram_paths.get("subscription_diagrams", {}).items():
+        sub_info = all_data.get(sub_id, {}).get("subscription_info", {})
+        sub_name = sub_info.get("display_name", sub_id)
+        
+        if "vnet_topology" in diagrams:
+            # Use relative path from markdown file to diagrams
+            diagram_path = f"../diagrams/{diagrams['vnet_topology']}"
+            # Ensure forward slashes for markdown compatibility
+            diagram_path = diagram_path.replace("\\", "/")
+            markdown.append(f"### {sub_name}\n")
+            markdown.append(f'<img src="{diagram_path}" alt="Network Topology for {sub_name}" style="max-width: 100%; height: auto;"/>')
+    
+    return "\n\n".join(markdown) if markdown else "_No subscription-specific diagrams available._"
 
 def _get_app_services_table(all_data):
     """Generates Markdown table for App Services."""
@@ -2528,6 +2508,13 @@ This document provides a comprehensive overview of the Azure environment for ten
             "content": _analyze_network_topology(subscription_data)
         })
 
+        # Add Network Diagrams if available
+        if diagram_paths:
+            doc_sections.append({
+                "title": "Network Topology Diagrams",
+                "content": _get_subscription_diagram_links(subscription_data, diagram_paths, output_dir)
+            })
+
         # Add Identity & Access Management
         doc_sections.append({
             "title": "Identity & Access Management",
@@ -2577,13 +2564,6 @@ The following subsections detail the AI and Machine Learning services currently 
             "content": _get_subscription_costs_table(subscription_data) + "\n\n" + _get_cost_optimization_summary(subscription_data)
         })
 
-        # Add Network Diagrams if available
-        if diagram_paths:
-            doc_sections.append({
-                "title": "Network Diagrams",
-                "content": _get_subscription_diagram_links(subscription_data, diagram_paths, output_dir)
-            })
-
         # Generate the markdown content
         markdown_content = []
         for section in doc_sections:
@@ -2599,7 +2579,9 @@ The following subsections detail the AI and Machine Learning services currently 
 
         # Write to file
         os.makedirs(output_dir, exist_ok=True)
-        output_file = os.path.join(output_dir, f"design_document_{timestamp_str}.md")
+        # Create a clean tenant name for the filename (replace spaces and special chars)
+        clean_tenant_name = tenant_name.replace(" ", "_").replace("/", "_").replace("\\", "_")
+        output_file = os.path.join(output_dir, f"Azure_Design_Document_{clean_tenant_name}_{timestamp_str}_v{version:.1f}.md")
         
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write("\n".join(markdown_content))
