@@ -111,7 +111,7 @@ A powerful automated tool that audits and documents Azure infrastructure across 
 
 ## Requirements
 
-* Python 3.8+
+* Python 3.12+
 * Azure Authentication (CLI or Service Principal)
 * Required Azure RBAC Permissions:
   - Reader role at subscription or management group level
@@ -123,7 +123,7 @@ A powerful automated tool that audits and documents Azure infrastructure across 
 
 1. Clone the Repository:
    ```bash
-   git clone <repository_url>
+   git clone https://github.com/inabubblewithyou/azure-documenter-tool.git
    cd azure-documenter-tool
    ```
 
@@ -133,7 +133,7 @@ A powerful automated tool that audits and documents Azure infrastructure across 
    source .venv/bin/activate  # Linux/macOS
    # or .venv\Scripts\activate.bat  # Windows CMD
    # or .venv\Scripts\Activate.ps1  # Windows PowerShell
-   pip install -r azure_documenter/requirements.txt
+   pip install -r requirements.txt
    ```
 
 3. Install Graphviz from https://graphviz.org/download/
