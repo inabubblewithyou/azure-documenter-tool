@@ -53,38 +53,66 @@ def compare_lists_by_id(list1, list2, id_key='id', name_key='name'):
 def analyze_delta(data1, data2):
     """Analyzes the differences between two audit data sets."""
     delta = {
+        "management_groups": {},
         "subscriptions": {
             "added": [],
             "removed": [],
             "details": {}
         }
+        # Other top-level keys like run_details, diagram_filenames are ignored for delta
     }
 
-    subs1 = set(data1.keys())
-    subs2 = set(data2.keys())
+    # --- Compare Management Groups (Top-Level List) ---
+    mg1 = data1.get("management_groups", [])
+    mg2 = data2.get("management_groups", [])
+    # Assuming Management Groups have an 'id' field suitable for comparison
+    delta["management_groups"] = compare_lists_by_id(mg1, mg2, id_key='id', name_key='displayName') 
+    logging.info(f"Management Group Delta: +{len(delta['management_groups']['added'])}, -{len(delta['management_groups']['removed'])}, ~{len(delta['management_groups']['modified'])}")
+    # --------------------------------------------
 
-    added_subs = subs2 - subs1
-    removed_subs = subs1 - subs2
-    common_subs = subs1 & subs2
+    # --- Compare Subscriptions (Data within the 'subscriptions' key) ---
+    subs_data1 = data1.get("subscriptions", {}) # Get the dictionary of subscriptions
+    subs_data2 = data2.get("subscriptions", {}) # Get the dictionary of subscriptions
 
-    delta["subscriptions"]["added"] = [data2[sub_id].get("subscription_info", {"id": sub_id}) for sub_id in added_subs]
-    delta["subscriptions"]["removed"] = [data1[sub_id].get("subscription_info", {"id": sub_id}) for sub_id in removed_subs]
+    subs1_ids = set(subs_data1.keys())
+    subs2_ids = set(subs_data2.keys())
+
+    added_subs = subs2_ids - subs1_ids
+    removed_subs = subs1_ids - subs2_ids
+    common_subs = subs1_ids & subs2_ids
+
+    # Populate added/removed based on the subscription info within the dicts
+    delta["subscriptions"]["added"] = [subs_data2[sub_id].get("subscription_info", {"id": sub_id}) for sub_id in added_subs]
+    delta["subscriptions"]["removed"] = [subs_data1[sub_id].get("subscription_info", {"id": sub_id}) for sub_id in removed_subs]
 
     logging.info(f"Subscription Changes: Added={len(added_subs)}, Removed={len(removed_subs)}, Common={len(common_subs)}")
 
+    # Iterate through common subscriptions for detailed comparison
     for sub_id in common_subs:
         logging.info(f"Analyzing delta for subscription: {sub_id}")
         sub_delta = {}
-        sub_data1 = data1[sub_id]
-        sub_data2 = data2[sub_id]
+        # Get data for the specific subscription ID
+        sub_data1 = subs_data1[sub_id]
+        sub_data2 = subs_data2[sub_id]
 
         # Handle cases where one of the subs might have errored out previously
-        if "error" in sub_data1 or "error" in sub_data2:
+        if isinstance(sub_data1, dict) and "error" in sub_data1 or \
+           isinstance(sub_data2, dict) and "error" in sub_data2:
              logging.warning(f"Skipping detailed delta for {sub_id} due to error in one of the audits.")
              sub_delta["error"] = "Error present in one of the audits."
              delta["subscriptions"]["details"][sub_id] = sub_delta
              continue
+        
+        # Ensure sub_data1 and sub_data2 are dictionaries before proceeding
+        if not isinstance(sub_data1, dict) or not isinstance(sub_data2, dict):
+            logging.error(f"Subscription data for {sub_id} is not a dictionary. Skipping delta.")
+            sub_delta["error"] = "Invalid data format for subscription."
+            delta["subscriptions"]["details"][sub_id] = sub_delta
+            continue
 
+        # --- Start detailed comparison for this subscription --- 
+        # (Existing comparison logic for resources, networking, governance remains here)
+        
         # Compare Resources
         resources1 = sub_data1.get("resources", [])
         resources2 = sub_data2.get("resources", [])
@@ -102,20 +130,19 @@ def analyze_delta(data1, data2):
         logging.info(f"  VNets Delta: +{len(sub_delta['networking']['vnets']['added'])}, -{len(sub_delta['networking']['vnets']['removed'])}, ~{len(sub_delta['networking']['vnets']['modified'])}")
         # Add logging for other network elements if needed
 
-        # TODO: Compare Security (RBAC, Score)
-        # RBAC comparison is complex due to potential scope changes and principal resolution
-
-        # TODO: Compare Costs (might not be meaningful for delta unless comparing specific dates)
-
-        # TODO: Compare Governance (Policy States, Advisor Recs)
+        # Compare Governance (Policy States, Advisor Recs)
         gov1 = sub_data1.get("governance", {})
         gov2 = sub_data2.get("governance", {})
         sub_delta["governance"] = {}
         # Policy state comparison needs careful handling - using resource_id + policy_definition_id? Or policy_state ID?
         # Let's try resource_id + policy_definition_id as a composite key for comparison
-        def get_policy_key(state): return f"{state.get('resource_id')}_{state.get('policy_definition_id')}"
-        policy_states1 = [{**item, 'comparison_key': get_policy_key(item)} for item in gov1.get("policy_states", [])]
-        policy_states2 = [{**item, 'comparison_key': get_policy_key(item)} for item in gov2.get("policy_states", [])]
+        def get_policy_key(state): 
+             # Handle potential None values
+             res_id = state.get('resource_id', 'unknown')
+             pol_id = state.get('policy_definition_id', 'unknown')
+             return f"{res_id}_{pol_id}"
+        policy_states1 = [{**item, 'comparison_key': get_policy_key(item)} for item in gov1.get("policy_states", []) if isinstance(item, dict)] # Ensure item is dict
+        policy_states2 = [{**item, 'comparison_key': get_policy_key(item)} for item in gov2.get("policy_states", []) if isinstance(item, dict)] # Ensure item is dict
         sub_delta["governance"]["policy_states"] = compare_lists_by_id(policy_states1, policy_states2, id_key='comparison_key', name_key='policy_definition_name')
 
         # Advisor recommendations comparison - use recommendation ID?
@@ -125,8 +152,10 @@ def analyze_delta(data1, data2):
         logging.info(f"  Policy Delta: +{len(sub_delta['governance']['policy_states']['added'])}, -{len(sub_delta['governance']['policy_states']['removed'])}, ~{len(sub_delta['governance']['policy_states']['modified'])}")
         logging.info(f"  Advisor Delta: +{len(sub_delta['governance']['advisor_recommendations']['added'])}, -{len(sub_delta['governance']['advisor_recommendations']['removed'])}, ~{len(sub_delta['governance']['advisor_recommendations']['modified'])}")
 
+        # Add more comparisons here as needed (e.g., Security, Costs)
 
         delta["subscriptions"]["details"][sub_id] = sub_delta
+        # -------------------------------------------------------------
 
     logging.info("Delta analysis complete.")
     return delta

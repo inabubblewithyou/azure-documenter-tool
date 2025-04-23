@@ -13,6 +13,7 @@ from azure.core.exceptions import HttpResponseError
 import asyncio # Add asyncio import
 import platform
 from typing import Dict, List, Tuple, Any
+import glob # Add glob import
 
 # --- Rich Import ---
 try:
@@ -117,7 +118,7 @@ file_handler.setFormatter(file_formatter)
 logger.addHandler(file_handler) # Add file handler to root logger
 
 # Suppress verbose Azure SDK logging (Set levels on specific loggers AFTER root logger is configured)
-for azure_logger_name in ['azure', 'azure.core', 'azure.identity', 'msrest', 'msal']:
+for azure_logger_name in ['azure', 'azure.core', 'azure.identity', 'msrest', 'msal', 'urllib3', 'httpx']:
     logging.getLogger(azure_logger_name).setLevel(logging.WARNING) # Changed to WARNING for less noise
 
 # --- Initial Log Message ---
@@ -376,12 +377,17 @@ async def process_subscription(credential, subscription_info, tenant_sp_summary)
                                 subscription_data["error"] = subscription_data.get("error", "") + f"; Cert fetch failed for {original_vault_uri}"
                             elif isinstance(cert_result, dict):
                                 target_vault["certificates"] = cert_result.get("certificates", [])
-                                if cert_result.get("error"):
-                                    target_vault["certificate_fetch_error"] = cert_result["error"]
-                                    logging.warning(f"[{sub_id}] Error reported within certificate fetch result for {original_vault_uri}: {cert_result['error']}")
+                                concise_error = cert_result.get("error")
+                                if concise_error:
+                                    # Log concise warning for console, store error in vault data
+                                    logger.warning(f"[{sub_id}] Failed to fetch certificates from {original_vault_uri}: {concise_error}")
+                                    target_vault["certificate_fetch_error"] = concise_error
+                                    # No need to add to subscription_data["error"] as it's specific to this vault
                             else:
-                                logging.warning(f"[{sub_id}] Unexpected result type for certificate fetch for {original_vault_uri}: {type(cert_result)}")
-                                target_vault["certificates"] = {"error": "Unexpected result type"}
+                                # Log unexpected type for debugging
+                                unexpected_type_error = f"Unexpected result type {type(cert_result)} for cert fetch {original_vault_uri}"
+                                logging.warning(f"[{sub_id}] {unexpected_type_error}")
+                                target_vault["certificates"] = {"error": unexpected_type_error}
                         else:
                             logging.warning(f"[{sub_id}] Could not find original vault entry for URI {original_vault_uri} after fetching certificates.")
                     else:
@@ -451,11 +457,13 @@ async def main():
 
     # Argument Parsing
     parser = argparse.ArgumentParser(description="Azure Documentation Tool")
-    parser.add_argument("--mode", choices=["Audit", "Design", "Compare"], default="Audit", help="Specify the output mode: Audit, Design, or Compare.")
+    parser.add_argument("--mode", choices=["Audit", "Design", "Compare", "Regenerate"], default="Audit", help="Specify the output mode: Audit, Design, Compare, or Regenerate.")
     parser.add_argument("--compare", nargs=2, metavar=("TIMESTAMP1", "TIMESTAMP2"), help="Compare two previous audit runs using timestamps (YYYYMMDD_HHMMSS format). Used with --mode Compare.")
     parser.add_argument("--all-subscriptions", action="store_true", help="Audit all accessible subscriptions without interactive selection.")
     parser.add_argument("--silent", "-s", action="store_true", help="Run in silent mode (suppress console output, but still log to file).")
     parser.add_argument("--llm", action="store_true", help="Enable LLM-enhanced report generation in Design mode.")
+    parser.add_argument("--input-timestamp", metavar="TIMESTAMP", help="Timestamp (YYYYMMDD_HHMMSS) of the previous run data file. Required for --mode Regenerate.")
+    parser.add_argument("--output-type", choices=["Audit", "Design"], help="Specify the report type to generate from JSON. Required for --mode Regenerate.")
     args = parser.parse_args()
     
     # Set global silent mode flag
@@ -494,20 +502,51 @@ async def main():
         if not SILENT_MODE: rprint(f"[bold yellow]Running in Delta Comparison mode:[/bold yellow] Comparing [cyan]{timestamp1}[/cyan] vs [cyan]{timestamp2}[/cyan]")
         logging.info(f"Running in Delta Comparison mode: Comparing {timestamp1} vs {timestamp2}")
 
-        file1 = os.path.join(DATA_DIR, f"azure_audit_raw_data_{timestamp1}.json")
-        file2 = os.path.join(DATA_DIR, f"azure_audit_raw_data_{timestamp2}.json")
+        # --- Find Files using Glob --- 
+        file1_path, file2_path = None, None
+        error_messages = []
 
-        if not os.path.exists(file1) or not os.path.exists(file2):
-            if not SILENT_MODE: rprint(f"[red]Error: Comparison file(s) not found. Checked paths:\n - {file1}\n - {file2}[/red]")
-            logging.error(f"Comparison file(s) not found: {file1}, {file2}")
+        for i, timestamp in enumerate([timestamp1, timestamp2]):
+            search_pattern = os.path.join(DATA_DIR, f"azure_audit_raw_data_*_{timestamp}_*.json")
+            matching_files = glob.glob(search_pattern)
+            
+            if len(matching_files) == 1:
+                if i == 0:
+                    file1_path = matching_files[0]
+                else:
+                    file2_path = matching_files[0]
+            elif len(matching_files) == 0:
+                error_messages.append(f"No data file found in {DATA_DIR} for timestamp {timestamp}. (Searched: {search_pattern})")
+            else:
+                error_messages.append(f"Ambiguous timestamp {timestamp}: Found multiple files: {matching_files}")
+
+        # Report errors if any files were not found or ambiguous
+        if error_messages:
+            if not SILENT_MODE:
+                rprint("[red]Error: Could not find unique data file(s) for comparison:[/red]")
+                for msg in error_messages:
+                    rprint(f"  - {msg}")
+            logging.error("Comparison file errors:")
+            for msg in error_messages:
+                logging.error(f"  - {msg}")
             sys.exit(1)
 
-        if not SILENT_MODE: rprint(f"Loading data from {file1} and {file2}...")
-        logging.info(f"Loading data from {file1} and {file2}...")
-        data1 = load_audit_data(file1)
-        data2 = load_audit_data(file2)
+        # --- End File Finding --- 
+
+        if not SILENT_MODE: rprint(f"Loading data from:\n - {os.path.basename(file1_path)}\n - {os.path.basename(file2_path)}")
+        logging.info(f"Loading data from {file1_path} and {file2_path}...")
+        # Load data using the found paths
+        data1 = load_audit_data(file1_path) 
+        data2 = load_audit_data(file2_path)
         
         if data1 and data2:
+            # --- Extract details from data2 for HTML metadata ---
+            run_details2 = data2.get("run_details", {})
+            tenant_display_name_comp = run_details2.get("tenant_display_name", "N/A")
+            tenant_domain_comp = run_details2.get("tenant_default_domain", "N/A")
+            version_comp = run_details2.get("version", "N/A")
+            # -----------------------------------------------------
+            
             if not SILENT_MODE: rprint("Analyzing differences...")
             logging.info("Analyzing differences...")
             delta = analyze_delta(data1, data2)
@@ -520,8 +559,18 @@ async def main():
             if delta_report_path:
                 if not SILENT_MODE: rprint("Converting delta report to HTML...")
                 logging.info("Converting delta report to HTML...")
-                # Pass REPORT_DIR and base filename prefix
-                html_report_path = export_markdown_to_html(delta_report_path, REPORT_DIR, f"delta_{timestamp1}_vs_{timestamp2}")
+                # Pass required arguments using keywords, deriving from data2
+                html_report_path = export_markdown_to_html(
+                    markdown_filepath=delta_report_path, 
+                    output_report_dir=REPORT_DIR, # <<< Corrected keyword
+                    # Use data from the second file for context
+                    tenant_display_name=tenant_display_name_comp, 
+                    tenant_default_domain=tenant_domain_comp, 
+                    document_version=version_comp, 
+                    timestamp_str=timestamp2, # Use the second timestamp 
+                    silent_mode=SILENT_MODE
+                    # Assuming the function handles delta filename generation
+                )
                 
                 if html_report_path:
                     if not SILENT_MODE:
@@ -543,6 +592,152 @@ async def main():
         logging.info("Azure Documenter Delta Comparison finished.")
         sys.exit(0) # Exit after comparison
     # --- End Delta Comparison Mode ---
+
+    # --- Handle Regeneration Mode ---
+    elif args.mode == "Regenerate":
+        # Validate required arguments for Regeneration mode
+        if not args.input_timestamp or not args.output_type:
+            if not SILENT_MODE: rprint("[red]Error: --input-timestamp and --output-type are required when using --mode Regenerate.[/red]")
+            logging.error("Regenerate mode selected without required --input-timestamp or --output-type arguments.")
+            sys.exit(1)
+        
+        input_timestamp = args.input_timestamp
+        
+        # Find the JSON file based on the timestamp
+        search_pattern = os.path.join(DATA_DIR, f"azure_audit_raw_data_*_{input_timestamp}_*.json")
+        matching_files = glob.glob(search_pattern) # Requires importing glob
+        
+        input_json_path = None
+        if len(matching_files) == 1:
+            input_json_path = matching_files[0]
+            if not SILENT_MODE: rprint(f"Found data file: [cyan]{input_json_path}[/cyan]")
+            logging.info(f"Found data file for timestamp {input_timestamp}: {input_json_path}")
+        elif len(matching_files) == 0:
+            if not SILENT_MODE: rprint(f"[red]Error: No data file found in {DATA_DIR} for timestamp {input_timestamp}. Searched pattern: {search_pattern}[/red]")
+            logging.error(f"No data file found for timestamp {input_timestamp} using pattern: {search_pattern}")
+            sys.exit(1)
+        else: # Found multiple files
+             if not SILENT_MODE: 
+                 rprint(f"[red]Error: Found multiple data files matching timestamp {input_timestamp} in {DATA_DIR}. Please ensure only one file exists for this timestamp or use the full path with a modified script.[/red]")
+                 for f in matching_files:
+                     rprint(f"  - {f}")
+             logging.error(f"Ambiguous timestamp: Found multiple files for timestamp {input_timestamp}: {matching_files}")
+             sys.exit(1)
+            
+        # Proceed only if input_json_path is set
+        if not input_json_path: # Should not happen if logic above is correct, but safety check
+             logging.error("Internal error: input_json_path was not set despite finding a file.")
+             sys.exit(1)
+
+        # Original Regeneration logic starts here, using input_json_path        
+        #if not os.path.exists(args.input_json): # Old check removed
+        #    if not SILENT_MODE: rprint(f"[red]Error: Input JSON file not found at {args.input_json}[/red]")
+        #    logging.error(f"Input JSON file not found for regeneration: {args.input_json}")
+        #    sys.exit(1)
+            
+        if not SILENT_MODE: rprint(f"[bold yellow]Running in Regeneration mode:[/bold yellow] Generating {args.output_type} report from timestamp [cyan]{input_timestamp}[/cyan] (File: {os.path.basename(input_json_path)})")
+        logging.info(f"Running in Regeneration mode: Generating {args.output_type} report from timestamp {input_timestamp} using file {input_json_path}")
+
+        # Load data from the found JSON path
+        loaded_data = load_audit_data(input_json_path)
+        if not loaded_data:
+            if not SILENT_MODE: rprint(f"[red]Error: Failed to load or parse data from {input_json_path}[/red]")
+            logging.error(f"Failed to load or parse data from {input_json_path}")
+            sys.exit(1)
+            
+        # Extract necessary data parts
+        run_details = loaded_data.get("run_details", {})
+        subscriptions_data = loaded_data.get("subscriptions", {})
+        management_groups_data = loaded_data.get("management_groups", [])
+        diagram_filenames = loaded_data.get("diagram_filenames", {}) # Load saved diagram paths
+        
+        # Extract details needed for generators from run_details
+        tenant_display_name = run_details.get("tenant_display_name", "Unknown Tenant")
+        tenant_default_domain = run_details.get("tenant_default_domain", "unknown.onmicrosoft.com")
+        original_timestamp = run_details.get("timestamp_local", "")
+        original_version = run_details.get("version", 1.0) # Use original version
+        tenant_id = run_details.get("tenant_id", "unknown_tenant") # Needed for saving new version if applicable
+
+        if not subscriptions_data:
+             if not SILENT_MODE: rprint("[red]Error: No subscription data found in the loaded JSON file.[/red]")
+             logging.error("No subscription data found in the loaded JSON file.")
+             sys.exit(1)
+             
+        # --- Generate Markdown Report (Audit or Design) --- 
+        generated_report_path = None
+        # Use a new timestamp for the regenerated report filename, but keep original version
+        regen_timestamp = get_formatted_timestamp()
+
+        if args.output_type == "Design":
+            if not SILENT_MODE: rprint(f"  Generating [bold]{args.output_type}[/bold] document from JSON data...")
+            logging.info(f"Generating {args.output_type} document from JSON data...")
+            generated_report_path = generate_design_document(
+                subscriptions_data, 
+                OUTPUT_BASE_DIR,
+                tenant_display_name,
+                tenant_default_domain,
+                original_version, # Use version from loaded data
+                management_group_data=management_groups_data,
+                diagram_paths=diagram_filenames, # Pass loaded diagram paths
+                timestamp_str=regen_timestamp, # Use new timestamp for filename
+                silent_mode=SILENT_MODE
+            )
+            # Note: LLM enhancement cannot be re-run from JSON easily, skip it.
+        elif args.output_type == "Audit": 
+            if not SILENT_MODE: rprint(f"  Generating [bold]{args.output_type}[/bold] report from JSON data...")
+            logging.info(f"Generating {args.output_type} report from JSON data...")
+            generated_report_path = generate_markdown_report(
+                subscriptions_data, # Pass only subscription data
+                OUTPUT_BASE_DIR,
+                tenant_display_name,
+                tenant_default_domain, 
+                original_version, # Use version from loaded data
+                diagram_paths=diagram_filenames, # Pass loaded diagram paths
+                timestamp_str=regen_timestamp, # Use new timestamp for filename
+                silent_mode=SILENT_MODE
+            )
+        # ----------------------------------------------------
+        
+        final_report_path = generated_report_path # No LLM for regen
+
+        # --- Generate HTML Report --- 
+        html_report_path = None
+        if final_report_path:
+            if not SILENT_MODE: rprint("  Converting report to HTML...")
+            logging.info("Converting report to HTML...")
+            html_report_path = export_markdown_to_html(
+                markdown_filepath=final_report_path,
+                output_report_dir=REPORT_DIR, # <<< Corrected keyword
+                tenant_display_name=processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant"), 
+                tenant_default_domain=processed_tenant_results.get("tenant_details", {}).get("default_domain", "unknown.onmicrosoft.com"), 
+                document_version=version, # <<< Use established version
+                timestamp_str=run_timestamp, 
+                silent_mode=SILENT_MODE
+            )
+
+            if not SILENT_MODE:
+                rprint(f"\n[bold green]Regenerated {args.output_type} Report Complete:[/bold green]")
+
+                if raw_data_filepath: rprint(f"  - Raw Data JSON: [cyan]{raw_data_filepath}[/cyan]")
+                if final_report_path: rprint(f"  - Markdown Report: [cyan]{final_report_path}[/cyan]")
+                # Diagram output logging needs adjustment based on generate_all_diagrams structure
+                if generated_diagram_paths:
+                     rprint("  - Diagrams: Check output in [cyan]{DIAGRAM_DIR}[/cyan]") # Simplified log
+                if html_report_path: rprint(f"  - HTML Report: [cyan]{html_report_path}[/cyan]")
+
+            logging.info(f"Documentation generated. Raw: {raw_data_filepath}, Report: {final_report_path}, HTML: {html_report_path}")
+
+            # --- Save Version AFTER successful report generation ---
+            save_version(tenant_id, version) # <<< Use correct tenant_id and established version
+
+        else:
+            if not SILENT_MODE: rprint("[red]Regenerated report generation failed.[/red]")
+            logging.error(f"Regenerated {args.output_type} report generation failed from {input_json_path}.")
+
+        if not SILENT_MODE: rprint("Azure Documenter Regeneration finished.")
+        logging.info("Azure Documenter Regeneration finished.")
+        sys.exit(0) # Exit after regeneration
+    # --- End Regeneration Mode ---
         
     # --- Normal Audit/Design Mode ---
     run_timestamp = get_formatted_timestamp() # Timestamp for this run
@@ -564,6 +759,9 @@ Run ID: [cyan]{run_timestamp}[/cyan]""",
         tenant_details_result = await fetch_tenant_details(credential)
         tenant_id = tenant_details_result.get("tenant_id", "unknown_tenant")
         error_value = tenant_details_result.get("error")
+
+        # Determine version number for this run EARLY
+        version = get_next_version(tenant_id) 
 
         # Refined Check: Exit if tenant_id is invalid OR if error_value is truthy (not None, not empty string)
         if not tenant_id or tenant_id == "unknown_tenant" or error_value:
@@ -648,44 +846,10 @@ Run ID: [cyan]{run_timestamp}[/cyan]""",
             rprint(f"[bold red]Main processing failed:[/bold red] {e}")
         sys.exit(1)
 
-    # --- Add Management Group Data to the final dict (for saving) ---
-    final_audit_data_to_save = { 
-         # Add run details for context in the JSON file
-         "run_details": {
-             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-             "timestamp_local": run_timestamp, 
-             "mode": args.mode,
-             "version": get_next_version(tenant_id),
-             "tenant_id": tenant_id, # Use the determined tenant_id
-             "tenant_display_name": processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant"), # Use the potentially Graph-fetched name
-             "selected_subscription_ids": [sub['id'] for sub in selected_subscriptions],
-         },
-         "management_groups": processed_tenant_results.get("management_groups", []),
-         "subscriptions": all_subscription_data # The main data keyed by sub ID
-     }
-    # --------------------------------------------------------------
-
-    # Add version to each subscription's data for diagrams
-    version = get_next_version(tenant_id)
-    for sub_id, data in all_subscription_data.items():
-        if isinstance(data, dict):
-            data["run_details"] = data.get("run_details", {})
-            data["run_details"]["version"] = version
-            data["subscription_info"] = data.get("subscription_info", {})
-            data["subscription_info"]["tenant_display_name"] = processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant")
-
-    # --- Save Raw Audit Data (JSON) ---
-    raw_data_filepath = save_raw_data(final_audit_data_to_save, "azure_audit_raw_data", run_timestamp)
-
-    # --- Report Generation ---
-    if not SILENT_MODE: rprint("[bold blue]Proceeding to report generation...")
-    logging.info("Proceeding to report generation...")
-
-    # Generate Diagrams 
+    # --- Generate Diagrams FIRST --- 
     if not SILENT_MODE: rprint("  Generating network diagrams...")
     logging.info("Generating diagrams...")
     
-    # Ensure diagram directory exists and is absolute
     diagram_dir = os.path.abspath(DIAGRAM_DIR)
     os.makedirs(diagram_dir, exist_ok=True)
     logging.info(f"Using diagram directory: {diagram_dir}")
@@ -701,19 +865,77 @@ Run ID: [cyan]{run_timestamp}[/cyan]""",
             logging.info(f"Subscription diagrams: {generated_diagram_paths['subscription_diagrams']}")
     else:
         logging.warning("No diagrams were generated")
+        generated_diagram_paths = {} # Initialize if empty
+
+    # --- Augment Subscription Data (BEFORE constructing final save dict) ---
+    for sub_id, data in all_subscription_data.items():
+        if isinstance(data, dict):
+            data["run_details"] = data.get("run_details", {})
+            data["run_details"]["version"] = version # <<< Use established version
+            data["subscription_info"] = data.get("subscription_info", {})
+            data["subscription_info"]["tenant_display_name"] = processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant")
+
+    # --- Construct the final data structure for saving (AFTER diagrams and augmentation) ---
+    final_audit_data_to_save = {
+         "run_details": {
+             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+             "timestamp_local": run_timestamp,
+             "mode": args.mode,
+             "version": version, # <<< Use established version
+             "tenant_id": tenant_id, # <<< Use correct tenant_id variable
+             "tenant_display_name": processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant"),
+             "tenant_default_domain": processed_tenant_results.get("tenant_details", {}).get("default_domain", "unknown.onmicrosoft.com"),
+             "selected_subscription_ids": [sub['id'] for sub in selected_subscriptions],
+         },
+         "management_groups": processed_tenant_results.get("management_groups", []),
+         "diagram_filenames": generated_diagram_paths,
+         "subscriptions": all_subscription_data
+     }
+    # --------------------------------------------------------------
+
+    # --- Save Raw Audit Data (JSON) ---
+    raw_data_filepath = save_raw_data(final_audit_data_to_save, "azure_audit_raw_data", run_timestamp)
+
+    # --- Report Generation ---
+    if not SILENT_MODE: rprint("[bold blue]Proceeding to report generation...")
+    logging.info("Proceeding to report generation...")
+
+    # Generate Diagrams 
+    # [This entire block is duplicate and should be removed]
+    # if not SILENT_MODE: rprint("  Generating network diagrams...")
+    # logging.info("Generating diagrams...")
+    
+    # # Ensure diagram directory exists and is absolute
+    # diagram_dir = os.path.abspath(DIAGRAM_DIR)
+    # os.makedirs(diagram_dir, exist_ok=True)
+    # logging.info(f"Using diagram directory: {diagram_dir}")
+    
+    # # Pass the subscription data dict directly
+    # generated_diagram_paths = generate_all_diagrams(all_subscription_data, diagram_dir, run_timestamp)
+    
+    # if generated_diagram_paths:
+    #     logging.info("Generated diagrams:")
+    #     if "tenant_diagrams" in generated_diagram_paths:
+    #         logging.info(f"Tenant diagrams: {generated_diagram_paths['tenant_diagrams']}")
+    #     if "subscription_diagrams" in generated_diagram_paths:
+    #         logging.info(f"Subscription diagrams: {generated_diagram_paths['subscription_diagrams']}")
+    # else:
+    #     logging.warning("No diagrams were generated")
+    #     # Ensure the variable is initialized even if no diagrams generated
+    #     generated_diagram_paths = {} 
 
     # --- Generate Markdown Report (Audit or Design) ---
-    generated_report_path = None 
+    generated_report_path = None
     if args.mode == "Design":
         if not SILENT_MODE: rprint(f"  Generating [bold]{args.mode}[/bold] document...")
         logging.info("Generating design document...")
         generated_report_path = generate_design_document(
-            all_subscription_data, # Pass ONLY the subscription data dict
+            all_subscription_data, 
             OUTPUT_BASE_DIR,
             processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant"),
             processed_tenant_results.get("tenant_details", {}).get("default_domain", "unknown.onmicrosoft.com"),
-            version, # Use the same version we used for diagrams
-            management_group_data=processed_tenant_results.get("management_groups", []), # Pass MG data separately
+            version, # <<< Use established version
+            management_group_data=processed_tenant_results.get("management_groups", []), 
             diagram_paths=generated_diagram_paths,
             timestamp_str=run_timestamp,
             silent_mode=SILENT_MODE
@@ -727,13 +949,12 @@ Run ID: [cyan]{run_timestamp}[/cyan]""",
     else: # Default to Audit mode
         if not SILENT_MODE: rprint(f"  Generating [bold]{args.mode}[/bold] report...")
         logging.info("Generating audit report...")
-        # Pass the FINAL combined data structure
         generated_report_path = generate_markdown_report(
-            final_audit_data_to_save, # Use the dict with MG data included
+            all_subscription_data, # <<< Pass correct data structure
             OUTPUT_BASE_DIR,
-            processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant"), 
-            processed_tenant_results.get("tenant_details", {}).get("default_domain", "unknown.onmicrosoft.com"), 
-            get_next_version(tenant_id), 
+            processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant"),
+            processed_tenant_results.get("tenant_details", {}).get("default_domain", "unknown.onmicrosoft.com"),
+            version, # <<< Use established version
             diagram_paths=generated_diagram_paths,
             timestamp_str=run_timestamp,
             silent_mode=SILENT_MODE
@@ -756,13 +977,12 @@ Run ID: [cyan]{run_timestamp}[/cyan]""",
     if final_report_path:
         if not SILENT_MODE: rprint("  Converting report to HTML...")
         logging.info("Converting report to HTML...")
-        html_filename_prefix = f"azure_{args.mode.lower()}_report"
         html_report_path = export_markdown_to_html(
-            final_report_path,
-            REPORT_DIR,
+            markdown_filepath=final_report_path,
+            output_report_dir=REPORT_DIR, # <<< Corrected keyword
             tenant_display_name=processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant"), 
             tenant_default_domain=processed_tenant_results.get("tenant_details", {}).get("default_domain", "unknown.onmicrosoft.com"), 
-            document_version=get_next_version(tenant_id), 
+            document_version=version, # <<< Use established version
             timestamp_str=run_timestamp, 
             silent_mode=SILENT_MODE
         )
@@ -780,7 +1000,7 @@ Run ID: [cyan]{run_timestamp}[/cyan]""",
         logging.info(f"Documentation generated. Raw: {raw_data_filepath}, Report: {final_report_path}, HTML: {html_report_path}")
 
         # --- Save Version AFTER successful report generation ---
-        save_version(tenant_id, get_next_version(tenant_id))
+        save_version(tenant_id, version) # <<< Use correct tenant_id and established version
 
     else:
         if not SILENT_MODE: rprint("[red]Report generation failed or skipped. Skipping HTML conversion and version save.[/red]")

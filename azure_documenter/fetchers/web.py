@@ -104,14 +104,14 @@ async def fetch_app_service_details(credential, subscription_id):
             try:
                 settings = web_client.web_apps.list_application_settings(app.resource_group, app.name)
                 if settings.properties:
-                    logging.info(f"[{subscription_id}] Fetched {len(settings.properties)} settings for app '{app.name}'.")
+                    logging.info(f"[{subscription_id}] Fetched {len(settings.properties)} settings for an App Service/Function App.")
                     app_settings_list = [
                         {"app_id": app.id, "app_name": app.name, "name": key, "value": "***" if "secret" in key.lower() or "key" in key.lower() or "connection" in key.lower() else value} 
                         for key, value in settings.properties.items()
                     ]
                     apps_data["app_settings"].extend(app_settings_list)
                 else:
-                    logging.info(f"[{subscription_id}] No application settings found for app '{app.name}'.")
+                    logging.info(f"[{subscription_id}] No application settings found for an App Service/Function App.")
             except HttpResponseError as settings_e:
                 logging.warning(f"[{subscription_id}] Could not list settings for app '{app.name}' (RG: {app.resource_group}): {settings_e.message}")
             except Exception as settings_e:

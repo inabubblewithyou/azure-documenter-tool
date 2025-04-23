@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timezone
 import time
 import re
+import html
 
 
 
@@ -1293,46 +1294,119 @@ def _get_vms_table(all_data):
 # ... existing code ...
 
 def _get_management_group_hierarchy_summary(mg_list):
-    """Analyzes Management Group hierarchy for the design document.
+    """Analyzes Management Group hierarchy and formats it hierarchically using HTML.
 
     Args:
-        mg_list (list): The list of management groups with parent_id relationships.
-        
+        mg_list (list): The list of management groups with parent relationships.
+
     Returns:
-        str: Markdown-formatted summary of the MG hierarchy.
+        str: HTML-formatted hierarchical summary of the MG hierarchy.
     """
     if not mg_list:
-        return "_No Management Groups found in tenant._"
-    
-    # Start with simple list approach
-    mg_summary = []
-    for mg in mg_list:
-        if isinstance(mg, dict):
-            name = mg.get('name') or mg.get('display_name', 'Unknown')
-            mg_id = mg.get('id', 'Unknown ID')
-            parent = mg.get('parent_name', 'Root')
-            if parent != 'Root':
-                mg_summary.append(f"- **{name}** (`{mg_id}`) ← *Child of {parent}*")
-            else:
-                mg_summary.append(f"- **{name}** (`{mg_id}`) ← *Root Level*")
-    
-    if not mg_summary:
-        return "_Management Group data format not compatible with analysis._"
-    
-    return "\n".join(mg_summary)
+        return "<p><em>No Management Groups found or fetched for tenant.</em></p>"
+
+    # Normalize IDs to handle potential inconsistencies (e.g., trailing slashes)
+    def normalize_mg_id(mg_id):
+        if not mg_id or not isinstance(mg_id, str):
+            return None
+        return mg_id.strip('/').lower()
+
+    mg_map = {normalize_mg_id(mg.get('id')): mg for mg in mg_list if isinstance(mg, dict) and mg.get('id')}
+    children_map = {}
+    roots = []
+
+    # Build parent-child relationships and identify roots
+    for mg_norm_id, mg in mg_map.items():
+        parent_id = mg.get('parent')
+        norm_parent_id = normalize_mg_id(parent_id)
+
+        if norm_parent_id and norm_parent_id in mg_map:
+            if norm_parent_id not in children_map:
+                children_map[norm_parent_id] = []
+            children_map[norm_parent_id].append(mg_norm_id)
+        else:
+            roots.append(mg_norm_id)
+
+    if not roots:
+         logging.warning("Could not determine root management groups. Displaying flat list.")
+         mg_summary = ["<p><em>Could not determine hierarchy, displaying flat list:</em></p>", "<ul>"]
+         for mg_id, mg in mg_map.items():
+             display_name = html.escape(mg.get('display_name') or mg.get('name', 'Unknown'))
+             parent_info = html.escape(f"Parent ID: {mg.get('parent')}") if mg.get('parent') else "No Parent Listed"
+             mg_summary.append(f"<li><strong>{display_name}</strong> (<code>{html.escape(mg.get('id', 'Unknown ID'))}</code>) - {parent_info}</li>")
+         mg_summary.append("</ul>")
+         return "\n".join(mg_summary)
+
+    output_lines = []
+
+    def format_mg_node_html(mg_norm_id):
+        """Recursively formats a management group and its children as HTML list items."""
+        if mg_norm_id not in mg_map:
+            return f"<li>Error: Management Group Normalized ID {html.escape(mg_norm_id)} not found</li>"
+
+        mg = mg_map[mg_norm_id]
+        display_name = html.escape(mg.get('display_name') or mg.get('name', 'Unknown'))
+        raw_mg_id = html.escape(mg.get('id', 'Unknown Original ID'))
+        name_to_display = display_name
+
+        if not mg.get('display_name') and mg.get('name') == mg.get('tenant_id'):
+             name_to_display = html.escape(f"Tenant Root Group ({mg.get('name')})")
+        elif not mg.get('display_name'):
+             name_to_display = html.escape(mg.get('name', 'Unknown'))
+
+        node_html = f"<li><strong>{name_to_display}</strong> (<code>{raw_mg_id}</code>)"
+
+        if mg_norm_id in children_map:
+            node_html += "\n<ul>\n" # Start nested list
+            # Sort children by display name for consistent output
+            sorted_children = sorted(
+                children_map[mg_norm_id],
+                key=lambda child_norm_id: (
+                    mg_map.get(child_norm_id, {}).get('display_name') or
+                    mg_map.get(child_norm_id, {}).get('name', '')
+                ).lower()
+            )
+            for child_norm_id in sorted_children:
+                node_html += format_mg_node_html(child_norm_id)
+            node_html += "</ul>\n" # End nested list
+
+        node_html += "</li>\n"
+        return node_html
+
+    # Sort roots by display name before processing
+    sorted_roots = sorted(
+        roots,
+        key=lambda root_norm_id: (
+            mg_map.get(root_norm_id, {}).get('display_name') or
+            mg_map.get(root_norm_id, {}).get('name', '')
+        ).lower()
+    )
+
+    output_lines.append("<h4>Management Group Hierarchy:</h4>") # Use a heading instead of Markdown title
+    output_lines.append("<ul>") # Start the main list
+    for root_norm_id in sorted_roots:
+        output_lines.append(format_mg_node_html(root_norm_id))
+    output_lines.append("</ul>")
+
+    # Remove the debug logging for Markdown
+    # logging.debug("Raw Markdown lines for MG Hierarchy:")
+    # for line in output_lines:
+    #     logging.debug(f"  MG Line: '{line}'")
+
+    return "\n".join(output_lines)
 
 def _analyze_rg_naming_patterns(all_data):
-    """Analyzes Resource Group naming patterns from all subscriptions.
-    
+    """Analyzes Resource Group naming patterns and returns an HTML summary.
+
     Args:
         all_data (dict): Dictionary of subscription data from fetchers.
-        
+
     Returns:
-        str: Markdown-formatted summary of detected patterns.
+        str: HTML-formatted summary of detected patterns.
     """
     if not all_data:
-        return "_No subscription data available for resource group analysis._"
-    
+        return "<p><em>No subscription data available for resource group analysis.</em></p>"
+
     # Collect all resource group names
     all_rgs = []
     for sub_id, data in all_data.items():
@@ -1342,10 +1416,10 @@ def _analyze_rg_naming_patterns(all_data):
         for rg in rgs:
             if isinstance(rg, dict) and "name" in rg:
                 all_rgs.append(rg["name"])
-    
+
     if not all_rgs:
-        return "_No resource groups found in the environment._"
-    
+        return "<p><em>No resource groups found in the environment.</em></p>"
+
     # Analyze patterns - look for common prefixes
     prefix_counts = {}
     for rg_name in all_rgs:
@@ -1353,24 +1427,25 @@ def _analyze_rg_naming_patterns(all_data):
         if len(parts) > 1:
             prefix = parts[0].lower()
             prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
-    
+
     # Find the top 3 most common prefixes
     sorted_prefixes = sorted(prefix_counts.items(), key=lambda x: x[1], reverse=True)
-    
+
     if not sorted_prefixes:
-        return "_No common patterns detected in resource group names._"
-    
-    # Create summary
-    prefix_summary = []
+        return "<p><em>No common patterns detected in resource group names.</em></p>"
+
+    # Create HTML summary
+    html_summary = []
+    html_summary.append(f"<p>Common patterns detected in {len(all_rgs)} resource groups:</p>")
+    html_summary.append("<ul>")
     for prefix, count in sorted_prefixes[:3]:
         percentage = (count / len(all_rgs)) * 100
-        prefix_summary.append(f"- Prefix `{prefix}-`: {count} groups ({percentage:.1f}% of total)")
-    
-    if prefix_summary:
-        pattern_text = "\n".join(prefix_summary)
-        return f"Common patterns detected in {len(all_rgs)} resource groups:\n{pattern_text}"
-    else:
-        return "_No clear naming patterns detected across resource groups._"
+        # Use html.escape for the prefix to be safe
+        escaped_prefix = html.escape(prefix)
+        html_summary.append(f"<li>Prefix <code>{escaped_prefix}-</code>: {count} groups ({percentage:.1f}% of total)</li>")
+    html_summary.append("</ul>")
+
+    return "\n".join(html_summary)
 
 def _analyze_resource_lifecycle(all_data):
     """Analyzes resource lifecycle patterns from the collected data.

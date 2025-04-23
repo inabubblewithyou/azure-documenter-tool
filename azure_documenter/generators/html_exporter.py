@@ -794,7 +794,7 @@ def export_markdown_to_html(markdown_filepath, output_report_dir, tenant_display
         intermediate_html = markdown.markdown(markdown_with_placeholders, extensions=[
             'markdown.extensions.tables',
             'markdown.extensions.fenced_code', 
-            'markdown.extensions.toc', 
+            'markdown.extensions.toc',
             'markdown.extensions.nl2br'
             ])
 

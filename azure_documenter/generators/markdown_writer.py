@@ -3,6 +3,7 @@ import logging
 import pandas as pd # For CSV export
 import datetime # Add datetime import for timezone-aware time
 import time # For local timezone name
+from io import StringIO
 
 # Define output directories relative to the main script or a base path
 REPORT_DIR = "reports"
@@ -64,7 +65,11 @@ def generate_markdown_report(all_data, base_output_dir, tenant_display_name, ten
     total_subnets = 0
     
     for sub_id, data in all_data.items():
+        # --- Defensive Check Removed --- 
+            
         if "error" in data:
+            logging.warning(f"Skipping report section for subscription {sub_id} due to previous error: {data['error']}")
+            md_content.append(f"\n---\n## Subscription: {sub_id} (Error)")
             continue
             
         # Count resources
@@ -122,6 +127,8 @@ def generate_markdown_report(all_data, base_output_dir, tenant_display_name, ten
     # Collect all privileged roles from each subscription
     all_privileged_roles = []
     for sub_id, data in all_data.items():
+        # --- Defensive Check Removed --- 
+            
         if "error" in data:
             continue
         security_data = data.get("security", {})
@@ -269,14 +276,10 @@ def generate_markdown_report(all_data, base_output_dir, tenant_display_name, ten
     tenant_diagrams = diagram_paths.get("tenant_diagrams", {})
     tenant_network_diagram = tenant_diagrams.get("network_topology")
     if tenant_network_diagram:
-        # Try to determine tenant name
-        tenant_name = "Azure Tenant"
-        for sub_id, sub_data in all_data.items():
-            if "subscription_info" in sub_data and "tenant_domain" in sub_data["subscription_info"]:
-                tenant_name = sub_data["subscription_info"]["tenant_domain"]
-                break
+        # Use the passed-in tenant_display_name for alt text
+        tenant_name = tenant_display_name if tenant_display_name else "Azure Tenant"
                 
-        relative_diagram_path = os.path.join("..", tenant_network_diagram).replace("\\", "/")
+        relative_diagram_path = os.path.join("..", "diagrams", tenant_network_diagram).replace("\\", "/")
         md_content.append("\n### Tenant-Wide Network Topology")
         md_content.append(f"![{tenant_name} - Network Topology]({relative_diagram_path})")
         md_content.append("\n_This diagram shows all Virtual Networks across subscriptions and their peering relationships._\n")
@@ -405,8 +408,8 @@ def generate_markdown_report(all_data, base_output_dir, tenant_display_name, ten
         sub_diagrams = subscription_diagrams.get(sub_id, {})
         vnet_diagram_path = sub_diagrams.get('vnet_topology')
         if vnet_diagram_path:
-            # Ensure the path is relative to the report file for correct linking
-            relative_diagram_path = os.path.join("..", vnet_diagram_path).replace("\\", "/") # Path relative to reports/ dir
+            # Ensure the path is relative to the report file and explicitly includes diagrams folder
+            relative_diagram_path = os.path.join("..", "diagrams", vnet_diagram_path).replace("\\", "/") # Path relative to reports/ dir
             md_content.append(f"\n**VNet Topology Diagram**\n")
             md_content.append(f"![VNet Topology for {sub_display_name} ({timestamp_str})]({relative_diagram_path})")
             md_content.append("\n") # Add space after diagram
@@ -508,8 +511,15 @@ def generate_markdown_report(all_data, base_output_dir, tenant_display_name, ten
     # --- Save Resources CSV ---
     csv_filepath = None
     if all_resources_list:
-        csv_filename = f"azure_resource_inventory_{timestamp_str}.csv"
-        csv_filepath = os.path.join(report_path_dir, csv_filename)
+        csv_dir = os.path.join(base_output_dir, "csv") # Define CSV directory path
+        os.makedirs(csv_dir, exist_ok=True) # Create the directory if it doesn't exist
+
+        # Clean tenant name for filename
+        clean_tenant_name = tenant_display_name.replace(" ", "_").replace("/", "_").replace("\\", "_")
+        # Construct filename
+        csv_filename = f"azure_audit_resource_summary_{clean_tenant_name}_{timestamp_str}_v{document_version:.1f}.csv"
+        csv_filepath = os.path.join(csv_dir, csv_filename) # Use csv_dir
+
         try:
             df = pd.DataFrame(all_resources_list)
             # Select and order columns for CSV clarity
@@ -518,10 +528,15 @@ def generate_markdown_report(all_data, base_output_dir, tenant_display_name, ten
             existing_cols = [c for c in cols if c in df.columns]
             df = df[existing_cols]
             df.to_csv(csv_filepath, index=False, encoding='utf-8')
-            logging.info(f"Successfully generated Resource Inventory CSV: {csv_filepath}")
+            logging.info(f"Resource summary saved to CSV: {csv_filepath}")
+            # Optionally add link to CSV in markdown? For now, just save it.
+            # report_content += f"\\n\\nResource inventory also available as [CSV file]({os.path.relpath(csv_filepath, report_dir)})."
+            # Keep the print statement using csv_filepath to confirm location
+            if not silent_mode: print(f"  [dim]Resource summary CSV saved to:[/dim] [bright_black]{csv_filepath}[/bright_black]")
         except Exception as e:
-            logging.error(f"Failed to write Resource Inventory CSV: {e}")
-            csv_filepath = None
+            logging.error(f"Failed to save resource summary CSV: {e}", exc_info=True)
+            if not silent_mode: print(f"  [red]Warning: Failed to save resource summary CSV: {e}[/red]")
+        # -----------------
 
     # Return the Markdown report path if successful
     return report_filepath if markdown_saved else None

@@ -6,6 +6,28 @@ from azure.keyvault.secrets import SecretClient # Added for secrets/certs
 from azure.keyvault.certificates import CertificateClient, CertificatePolicy # Added for certs
 from azure.core.exceptions import HttpResponseError, ClientAuthenticationError
 
+logger = logging.getLogger(__name__)
+
+def _extract_concise_error(error: Exception) -> str:
+    """Extracts a concise reason from common Key Vault access errors."""
+    if isinstance(error, ClientAuthenticationError):
+        return "Authentication failed"
+    elif isinstance(error, HttpResponseError):
+        if error.status_code == 403: # Forbidden
+            if "does not have certificates list permission" in error.message:
+                return "Permission Denied (list certificates)"
+            elif "Client address is not authorized" in error.message or "ForbiddenByFirewall" in error.message:
+                return "Firewall Blocked"
+            else:
+                return f"Forbidden ({error.reason})"
+        elif error.status_code == 404: # Not Found
+            return "Vault or Resource Not Found"
+        else:
+            return f"HTTP Error {error.status_code} ({error.reason})"
+    else:
+        # Generic error message for unexpected types
+        return f"Unexpected error: {type(error).__name__}"
+
 # Fetch Key Vaults (Management Plane)
 async def fetch_key_vaults(credential, subscription_id):
     """Fetches Key Vault resources within the subscription."""
@@ -93,30 +115,34 @@ async def fetch_key_vault_certificates(credential, vault_uri):
                 }
                 certificates_data["certificates"].append(cert_info)
             except Exception as e:
-                logging.warning(f"Could not fetch details for certificate '{cert_props.name}' in vault {vault_uri}: {e}")
+                concise_error = _extract_concise_error(e)
+                logging.warning(f"Could not fetch details for certificate '{cert_props.name}' in vault {vault_uri}: {concise_error}")
                 # Append basic info even if detail fetch fails
                 certificates_data["certificates"].append({
                     "name": cert_props.name,
                     "id": cert_props.id,
                     "enabled": cert_props.enabled,
-                    "error": f"Failed to fetch full details: {e}"
+                    "error": concise_error
                 })
 
         logging.info(f"Found {count} certificates in {vault_uri}.")
 
     except (HttpResponseError, ClientAuthenticationError) as e:
-         error_message = f"Authentication or permission error accessing Key Vault {vault_uri} for certificates: {e}"
-         certificates_data["error"] = error_message
-         logging.warning(error_message)
+        concise_error = _extract_concise_error(e)
+        # Log full error details to file log at DEBUG level
+        logging.debug(f"Error accessing Key Vault {vault_uri} for certificates: {e}", exc_info=True)
+        certificates_data["error"] = concise_error
     except ImportError:
-         error_message = f"azure-keyvault-certificates library not found. Please install it."
-         certificates_data["error"] = error_message
-         logging.warning(error_message)
+        error_message = f"azure-keyvault-certificates library not found. Please install it."
+        certificates_data["error"] = error_message
+        # Log this specific config issue as WARNING
+        logging.warning(error_message)
     except Exception as e:
-         # Catch other potential errors like vault not found, network issues etc.
-         error_message = f"Unexpected error fetching certificates from {vault_uri}: {e}"
-         certificates_data["error"] = error_message
-         logging.error(error_message)
+        # Catch any other unexpected errors
+        concise_error = _extract_concise_error(e)
+        # Log full error details to file log at DEBUG level
+        logging.debug(f"Unexpected error fetching certificates from {vault_uri}: {e}", exc_info=True)
+        certificates_data["error"] = concise_error
 
     return certificates_data
 

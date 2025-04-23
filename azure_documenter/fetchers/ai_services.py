@@ -40,7 +40,7 @@ async def fetch_ai_services(credential, subscription_id: str) -> Dict[str, Any]:
         # Fetch Cognitive Services accounts
         try:
             accounts = list(cognitive_client.accounts.list())
-            logger.info(f"Found {len(accounts)} Cognitive Services accounts")
+            logger.info(f"[{subscription_id}] Found {len(accounts)} Cognitive Services accounts")
             
             for account in accounts:
                 account_data = {
@@ -58,7 +58,7 @@ async def fetch_ai_services(credential, subscription_id: str) -> Dict[str, Any]:
         # Fetch Search Services
         try:
             services = list(search_client.services.list_by_subscription())
-            logger.info(f"Found {len(services)} Search services")
+            logger.info(f"[{subscription_id}] Found {len(services)} Search services")
             
             for service in services:
                 service_data = {
@@ -77,7 +77,7 @@ async def fetch_ai_services(credential, subscription_id: str) -> Dict[str, Any]:
         # Fetch Bot Services
         try:
             bots = list(bot_client.bots.list())
-            logger.info(f"Found {len(bots)} Bot services")
+            logger.info(f"[{subscription_id}] Found {len(bots)} Bot services")
             
             for bot in bots:
                 bot_data = {
