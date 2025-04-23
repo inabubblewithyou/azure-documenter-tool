@@ -1,6 +1,5 @@
 # Azure Documenter Tool
 
-[![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
 ## Overview
 
@@ -74,64 +73,39 @@ Based on the fetched data, the tool generates various outputs using modules in `
 
 ## Requirements
 
-### Software
-1.  **Python:** Version 3.8 or higher.
-2.  **Git:** To clone the repository.
-3.  **Graphviz:** Required for generating network diagrams. Install from [graphviz.org/download/](https://graphviz.org/download/) and ensure the `dot` executable is in your system's PATH.
-4.  **Python Packages:** Listed in `requirements.txt`.
-
-### Azure
-1.  **Azure Account:** Access to an Azure tenant and one or more subscriptions.
-2.  **Azure RBAC Permissions:** The identity running the tool (User or Service Principal) needs appropriate permissions on the target subscriptions or management groups.
-    *   **Minimum:** The **`Reader`** role is generally required for basic resource discovery.
-    *   **Recommended for Full Detail:** To fetch comprehensive details across all categories (especially security settings, cost data, policy assignments, and Entra ID information), broader permissions might be necessary. Consider roles like **`Security Reader`**, **`Cost Management Reader`**, and potentially permissions to read Entra ID data (like **`Directory Readers`**). Always grant permissions based on the principle of least privilege according to your organization's policies.
+* Python 3.12+
+* Azure Authentication (CLI or Service Principal)
+* Required Azure RBAC Permissions:
+  - Reader role at subscription or management group level
+  - Additional permissions for enhanced features (e.g., Graph API)
+* Graphviz for diagram generation
+* Python packages from requirements.txt
 
 ## Installation
 
-1.  **Clone the Repository:**
-    ```bash
-    git clone <repository_url> # Replace with the actual URL
-    cd azure-documenter-tool
-    ```
+1. Clone the Repository:
+   ```bash
+   git clone https://github.com/inabubblewithyou/azure-documenter-tool.git
+   cd azure-documenter-tool
+   ```
 
-2.  **Create and Activate a Virtual Environment:** (Recommended)
-    ```bash
-    # Linux/macOS
-    python3 -m venv .venv
-    source .venv/bin/activate
+2. Install Python Dependencies:
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate  # Linux/macOS
+   # or .venv\Scripts\activate.bat  # Windows CMD
+   # or .venv\Scripts\Activate.ps1  # Windows PowerShell
+   pip install -r requirements.txt
+   ```
 
-    # Windows (Command Prompt)
-    python -m venv .venv
-    .venv\\Scripts\\activate.bat
+3. Install Graphviz from https://graphviz.org/download/
 
-    # Windows (PowerShell)
-    python -m venv .venv
-    .venv\\Scripts\\Activate.ps1
-    ```
-
-3.  **Install Python Dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *(Note: The `requirements.txt` file is located inside the project root)*
-
-4.  **Install Graphviz:** Follow instructions for your OS at [graphviz.org/download/](https://graphviz.org/download/). Verify installation by running `dot -V` in your terminal.
-
-## Authentication
-
-The tool uses Azure Identity's `DefaultAzureCredential`. This automatically tries multiple authentication methods in a predefined order. The most common methods are:
-
-1.  **Azure CLI:** Log in via your terminal before running the script. This is often the simplest method for interactive use.
-    ```bash
-    az login
-    az account set --subscription <your-target-subscription-id> # Optional, but recommended
-    ```
-2.  **Environment Variables (Service Principal):** Suitable for automation. Set the following environment variables:
-    *   `AZURE_CLIENT_ID`: The Application (client) ID of your Service Principal.
-    *   `AZURE_TENANT_ID`: Your Azure Tenant ID.
-    *   `AZURE_CLIENT_SECRET`: The client secret for your Service Principal.
-    *(See Azure documentation for creating Service Principals and assigning roles).*\
-3.  **Other Methods:** `DefaultAzureCredential` also supports Managed Identity (useful when running on Azure resources like VMs or App Services), Visual Studio Code credentials, etc. See the Azure SDK for Python documentation for the full list and order.
+4. Authenticate to Azure:
+   ```bash
+   az login
+   # Optional: Set default subscription
+   az account set --subscription <subscription-id>
+   ```
 
 ## Usage
 
@@ -177,63 +151,34 @@ python azure_documenter/main.py --mode Regenerate --input-timestamp 20240115_112
 
 ## Output Structure
 
-All outputs are placed in the `outputs/` directory, created inside the `azure_documenter` folder:
-
 ```
-azure-documenter-tool/
-├── azure_documenter/
-│   ├── outputs/
-│   │   ├── reports/          # Generated Markdown (.md) and HTML (.html) reports
-│   │   ├── diagrams/         # Network topology diagrams (.png)
-│   │   ├── data/             # Raw fetched data per run (.json)
-│   │   ├── logs/             # Detailed execution logs (.log)
-│   │   ├── csv/              # CSV data exports (e.g., resource summary from Audit mode)
-│   │   └── version_tracking/ # Stores the latest version number for Design Docs
-│   ├── fetchers/
-│   ├── generators/
-│   └── main.py
-├── requirements.txt
-└── README.md
+outputs/
+├── reports/          # Markdown and HTML reports
+├── diagrams/         # Network topology diagrams
+├── data/            # Raw JSON audit data
+├── logs/            # Detailed execution logs
+└── version_tracking/ # Document version tracking
 ```
 
-*   **Reports:** Files are named descriptively, including the mode (Audit/Design/Delta/Regenerated type), tenant name, timestamp, and version (for Design mode).
-*   **Diagrams:** Named by tenant/subscription and type (e.g., `tenant_network_topology_<timestamp>.png`, `subid_vnet_topology_<timestamp>.png`).
-*   **Data:** Raw JSON files are named `azure_audit_raw_data_{TenantName}_{Timestamp}_v{Version}.json`. These comprehensive files contain all data fetched during the run and are essential for the `--mode Compare` and `--mode Regenerate` features.
-*   **Logs:** Named `azure_documenter_run_{Timestamp}.log`.
-*   **CSV Exports:** Contains structured data exports. Currently includes `azure_audit_resource_summary_{TenantName}_{Timestamp}_v{Version}.csv` generated during Audit mode runs.
-*   **Version Tracking:** JSON files named `tenant_{TenantID}.json` track the latest version number used for a tenant's Design documents.
+## Configuration
 
-## Configuration (Optional - LLM Integration)
+* Mode Selection: Audit (default) or Design
+* Subscription Scope: Interactive or all subscriptions
+* Output Control: Normal or silent mode
+* Logging: Console (INFO) and File (DEBUG)
+* LLM Integration: Configure via environment variables:
+  ```env
+  # For Azure OpenAI:
+  LLM_PROVIDER=AZURE_OPENAI
+  AZURE_OPENAI_API_KEY=your_api_key
+  AZURE_OPENAI_ENDPOINT=your_endpoint
+  AZURE_OPENAI_DEPLOYMENT=your_deployment_name
 
-To use the `--llm` feature for enhanced Design Documents, you need to configure access to an OpenAI or Azure OpenAI model.
+  # Or for OpenAI:
+  LLM_PROVIDER=OPENAI
+  OPENAI_API_KEY=your_api_key
+  ```
 
-1.  Create a `.env` file in the `azure_documenter` directory (alongside `main.py`).
-2.  Add the relevant variables based on your provider:
+## Documentation
 
-    **For Azure OpenAI:**
-    ```dotenv
-    LLM_PROVIDER=AZURE_OPENAI
-    AZURE_OPENAI_API_KEY=your_api_key
-    AZURE_OPENAI_ENDPOINT=https://your-aoai-resource.openai.azure.com/
-    AZURE_OPENAI_DEPLOYMENT=your_deployment_or_model_name
-    # Optional: Specify API version if needed
-    # AZURE_OPENAI_API_VERSION=2023-05-15
-    ```
-
-    **For OpenAI:**
-    ```dotenv
-    LLM_PROVIDER=OPENAI
-    OPENAI_API_KEY=your_openai_api_key
-    # Optional: Specify model name if not using default (e.g., gpt-4)
-    # OPENAI_MODEL_NAME=gpt-4
-    ```
-
-Ensure the model you specify (via deployment name or model name) is suitable for text generation and analysis tasks. If `LLM_PROVIDER` is not set or set to `none`, the LLM features will be disabled.
-
-## Contributing
-
-Contributions are welcome! Please follow standard Fork and Pull Request workflows. Ensure code includes appropriate logging and adheres to general Python best practices.
-
-## License
-
-(Specify License Here - e.g., MIT License) 
+For detailed documentation, feature descriptions, and troubleshooting guides, please refer to the project wiki. 
