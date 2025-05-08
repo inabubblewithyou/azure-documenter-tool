@@ -708,27 +708,27 @@ async def main():
             html_report_path = export_markdown_to_html(
                 markdown_filepath=final_report_path,
                 output_report_dir=REPORT_DIR, # <<< Corrected keyword
-                tenant_display_name=processed_tenant_results.get("tenant_details", {}).get("display_name", "Unknown Tenant"), 
-                tenant_default_domain=processed_tenant_results.get("tenant_details", {}).get("default_domain", "unknown.onmicrosoft.com"), 
-                document_version=version, # <<< Use established version
-                timestamp_str=run_timestamp, 
+                tenant_display_name=tenant_display_name, 
+                tenant_default_domain=tenant_default_domain, 
+                document_version=original_version, # <<< Use established version
+                timestamp_str=regen_timestamp, 
                 silent_mode=SILENT_MODE
             )
 
             if not SILENT_MODE:
                 rprint(f"\n[bold green]Regenerated {args.output_type} Report Complete:[/bold green]")
 
-                if raw_data_filepath: rprint(f"  - Raw Data JSON: [cyan]{raw_data_filepath}[/cyan]")
+                if input_json_path: rprint(f"  - Raw Data JSON: [cyan]{input_json_path}[/cyan]")
                 if final_report_path: rprint(f"  - Markdown Report: [cyan]{final_report_path}[/cyan]")
                 # Diagram output logging needs adjustment based on generate_all_diagrams structure
-                if generated_diagram_paths:
+                if diagram_filenames:
                      rprint("  - Diagrams: Check output in [cyan]{DIAGRAM_DIR}[/cyan]") # Simplified log
                 if html_report_path: rprint(f"  - HTML Report: [cyan]{html_report_path}[/cyan]")
 
-            logging.info(f"Documentation generated. Raw: {raw_data_filepath}, Report: {final_report_path}, HTML: {html_report_path}")
+            logging.info(f"Documentation generated. Raw: {input_json_path}, Report: {final_report_path}, HTML: {html_report_path}")
 
             # --- Save Version AFTER successful report generation ---
-            save_version(tenant_id, version) # <<< Use correct tenant_id and established version
+            save_version(tenant_id, original_version) # <<< Use correct tenant_id and established version
 
         else:
             if not SILENT_MODE: rprint("[red]Regenerated report generation failed.[/red]")
